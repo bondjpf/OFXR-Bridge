@@ -301,8 +301,35 @@ jobs:
             $header = "$build/generated-shaders/synthesize_midpoint_pixel_shader.hpp"
             if (-not (Test-Path $header)) { throw "Missing compiled FidelityFX synthesis shader: $modeName" }
             $shaderHashes[$modeName] = (Get-FileHash $header -Algorithm SHA256).Hash
-            ctest --test-dir $build -C Release --output-on-failure --timeout 300 -LE needs_gpu_timing
-            if ($LASTEXITCODE -ne 0) { throw "Tests failed: $modeName" }
+            # Stock shaders must pass the complete supported suite.
+            # The two experimental shaders intentionally change synthetic pixel
+            # output, invalidating two upstream image-quality regression oracles:
+            # xrfg_d3d12_history_tests and xrfg_d3d12_hybrid_composition.
+            # Do NOT claim those pass for experimental modes. Every other
+            # supported test still runs and fails the job on regression.
+            $ctestArgs = @('--test-dir', $build, '-C', 'Release',
+              '--output-on-failure', '--timeout', '300', '-LE', 'needs_gpu_timing')
+            $resultFile = "dist/OFXR-V577-HeadMotion-AB/$modeName-TESTS.txt"
+            New-Item -ItemType Directory -Force 'dist/OFXR-V577-HeadMotion-AB' | Out-Null
+            if ($number -eq 0) {
+              "FULL upstream CTest suite (except GPU-timing-labeled tests)." |
+                Set-Content -Encoding utf8 $resultFile
+            } else {
+              $ctestArgs += @('-E', '^xrfg_d3d12_(history_tests|hybrid_composition)$')
+              Write-Warning (('Two pixel-output tests are NOT RUN for {0}: ' +
+                'xrfg_d3d12_history_tests; xrfg_d3d12_hybrid_composition. ' +
+                'Original expected images are incompatible with the intentional shader experiment.') -f $modeName)
+              @"
+          Variant $modeName (compile-time shader mode $number)
+          NOT RUN: xrfg_d3d12_history_tests; xrfg_d3d12_hybrid_composition.
+          Reason: upstream tests assert original frame reconstruction pixel values;
+          this variant deliberately alters those values.
+          All other enabled non-GPU-timing CTests must pass.
+          A Windows GPU/VR visual correctness verdict is NOT established by this run.
+          "@ | Set-Content -Encoding utf8 $resultFile
+            }
+            & ctest @ctestArgs
+            if ($LASTEXITCODE -ne 0) { throw "Supported tests failed: $modeName" }
             $out = "dist/OFXR-V577-HeadMotion-AB/$modeName"
             New-Item -ItemType Directory -Force "$out/ofxr", "$out/licenses", `
               "$out/external/OpenXR-SDK/LICENSES", "$out/external/Vulkan-Headers" | Out-Null
@@ -326,7 +353,7 @@ jobs:
             if (-not (Test-Path "$out/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll")) {
               throw "Missing experimental layer DLL: $modeName"
             }
-            Write-Host "Built/tested/staged $modeName | shader SHA256 $($shaderHashes[$modeName])"
+            Write-Host "Built/selected-tests-passed/staged $modeName | shader SHA256 $($shaderHashes[$modeName])"
             # Reclaim Windows runner disk space before building the next variant.
             Remove-Item -Recurse -Force $build
           }
@@ -342,6 +369,11 @@ jobs:
           OFXR V577 HEAD-MOTION A/B COMPARISON (UNSIGNED)
 
           01-stock: original V577 rendering (same pipeline, compile-time mode 0).
+          VALIDATION: Stock uses full CTest (except needs_gpu_timing). Both modified
+          shaders exclude only the two original-image pixel-output regression tests:
+          xrfg_d3d12_history_tests and xrfg_d3d12_hybrid_composition.
+          They are NOT PASSED, NOT RUN and require variant-specific GPU tests.
+
           02-pose-hold: diagnostic, deliberately shows latest real B-camera image
             in generated slots. Expect visibly jerky 24Hz scene motion. If the
             DOUBLE EDGES disappear it implicates synthesis; if not, investigate
@@ -373,7 +405,7 @@ jobs:
               '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $rel
             }
           $checksums | Set-Content -Encoding ascii "$root/SHA256SUMS.txt"
-          Write-Host 'All three shader bytecodes differ, Windows builds and tests passed.'
+          Write-Host 'All bytecodes differ; stock full tests passed, modified modes passed supported tests (2 pixel oracles excluded per modified mode).' 
 
       - name: Upload all three ready-to-extract comparison variants
         uses: actions/upload-artifact@v4
