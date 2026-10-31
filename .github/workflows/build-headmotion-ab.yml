@@ -1,4 +1,4 @@
-name: OFXR Pico4 VDXR head-motion A-B V577
+name: OFXR Pico4 VDXR head-motion A-B V577 (security audit)
 
 on:
   workflow_dispatch:
@@ -406,6 +406,91 @@ jobs:
             }
           $checksums | Set-Content -Encoding ascii "$root/SHA256SUMS.txt"
           Write-Host 'All bytecodes differ; stock full tests passed, modified modes passed supported tests (2 pixel oracles excluded per modified mode).' 
+
+      - name: Audit compiled EXEs and DLLs with Microsoft Defender
+        shell: pwsh
+        run: |
+          # This step DOES NOT assert that an unsigned binary is safe.
+          # Fail closed if on-runner anti-malware scanning is unavailable.
+          $ErrorActionPreference = 'Stop'
+          $auditRoot = 'dist/security-audit'
+          New-Item -ItemType Directory -Force $auditRoot | Out-Null
+          $report = Join-Path $auditRoot 'SecurityAudit.txt'
+          $lines = [System.Collections.Generic.List[string]]::new()
+          function Record([string] $message) {
+            $lines.Add($message)
+            Write-Host $message
+            $lines | Set-Content -Path $report -Encoding utf8
+          }
+          Record ('OFXR V577 A/B Windows binary security audit; UTC: ' + (Get-Date).ToUniversalTime().ToString('o'))
+          Record ('Workflow: ' + $env:GITHUB_WORKFLOW)
+          Record ('Runner: ' + $env:RUNNER_OS)
+          Record ('Commit: ' + $env:UPSTREAM_COMMIT)
+          $root = (Resolve-Path 'dist/OFXR-V577-HeadMotion-AB').Path
+          $binaries = @(Get-ChildItem $root -Recurse -File | Where-Object {
+            $_.Extension -in @('.exe', '.dll')
+          } | Sort-Object FullName)
+          Record ('Binary count: ' + $binaries.Count)
+          if ($binaries.Count -ne 9) { throw 'Expected three EXEs and six DLLs' }
+          foreach ($binary in $binaries) {
+            $rel = $binary.FullName.Substring($root.Length + 1).Replace('\','/')
+            Record ('BIN SHA256=' + (Get-FileHash $binary.FullName -Algorithm SHA256).Hash + '  ' + $rel)
+          }
+          if (-not (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) -or
+              -not (Get-Command Start-MpScan -ErrorAction SilentlyContinue) -or
+              -not (Get-Command Get-MpThreatDetection -ErrorAction SilentlyContinue)) {
+            Record 'INDETERMINATE: Microsoft Defender scanning cmdlets are unavailable on this runner'
+            throw 'Security audit unavailable. Binary artifact not uploaded.'
+          }
+          try {
+            $status = Get-MpComputerStatus -ErrorAction Stop
+            Record ('Defender AMServiceEnabled=' + $status.AMServiceEnabled +
+              ' AntivirusEnabled=' + $status.AntivirusEnabled +
+              ' SignatureLastUpdated=' + $status.AntivirusSignatureLastUpdated)
+            if (-not $status.AMServiceEnabled -or -not $status.AntivirusEnabled) {
+              Record 'INDETERMINATE: Microsoft Defender Antivirus is disabled on this runner'
+              throw 'Security audit unavailable. Binary artifact not uploaded.'
+            }
+            if ($null -eq $status.AntivirusSignatureLastUpdated -or
+                $status.AntivirusSignatureLastUpdated -lt (Get-Date).AddDays(-14)) {
+              Record 'INDETERMINATE: Antivirus signatures are older than 14 days'
+              throw 'Defender signatures too old to permit artifact upload.'
+            }
+            $auditStart = (Get-Date).AddMinutes(-30)
+            foreach ($binary in $binaries) {
+              Record ('Scanning ' + $binary.FullName)
+              Start-MpScan -ScanType CustomScan -ScanPath $binary.FullName -ErrorAction Stop
+              if (-not (Test-Path -LiteralPath $binary.FullName)) {
+                Record ('DETECTION OR QUARANTINE: binary disappeared after scanning: ' + $binary.Name)
+                throw 'Security scan removed a file. Binary artifact not uploaded.'
+              }
+            }
+            $detections = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object {
+              $_.InitialDetectionTime -ge $auditStart
+            })
+            foreach ($detection in $detections) {
+              Record ('DETECTION: ThreatID=' + $detection.ThreatID +
+                ' Time=' + $detection.InitialDetectionTime +
+                ' Resources=' + ($detection.Resources -join ';'))
+            }
+            if ($detections.Count -gt 0) {
+              throw 'Defender reported detections. Binary artifact not uploaded.'
+            }
+            Record 'SCAN RESULT: no recent detections returned by Microsoft Defender on this runner.'
+            Record 'LIMITATION: a clean scan is NOT proof of safety; browser warning may remain.'
+          } catch {
+            Record ('AUDIT FAILED: ' + $_.Exception.Message)
+            throw
+          }
+
+      - name: Upload source-only security audit report (no binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-V577-SECURITY-AUDIT-TEXT-ONLY
+          path: dist/security-audit/SecurityAudit.txt
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Upload all three ready-to-extract comparison variants
         uses: actions/upload-artifact@v4
