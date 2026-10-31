@@ -1,0 +1,245 @@
+name: OFXR Pico4 VDXR four-tap experiment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_COMMIT: 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e
+  FFX_TAG: v1.1.4
+  FFX_COMMIT: c6efa6bf7f2027b3ec94f28578bb5965eabb9e55
+  FFX_ROOT: external/FidelityFX-SDK-v1.1.4
+  DLSS_TAG: v310.9.1
+  DLSS_COMMIT: 374959484e79a640feaba44c93ac8cfb0a03f5b5
+  OPENVR_TAG: v2.5.1
+  OPENVR_SHA256: 94E5545370159C85F87CD6E15DD3739F7C919FC7A6E869F5E4ED463533A07ED0
+
+jobs:
+  experimental-build:
+    name: Windows x64 build, test and package
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Check out exact upstream 0.2.14.3 (V577)
+        uses: actions/checkout@v4
+        with:
+          repository: djules75/OFXR-Bridge
+          ref: 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e
+          persist-credentials: false
+
+      - name: Verify upstream commit
+        shell: pwsh
+        run: |
+          $hash = (git rev-parse HEAD).Trim()
+          if ($hash -ne $env:UPSTREAM_COMMIT) { throw "Unexpected upstream commit: $hash" }
+          Write-Host "Pinned upstream: $hash"
+
+      - name: Apply experimental HLSL/CMake patch
+        shell: pwsh
+        run: |
+          # The following patch is embedded: no untrusted patch download.
+          $patch = @'
+          --- a/CMakeLists.txt
+          +++ b/CMakeLists.txt
+          @@ -117,4 +117,14 @@
+                   message(FATAL_ERROR "fxc.exe from the Windows SDK is required for frame-synthesis shaders")
+               endif()
+           
+          +    # Experimental FidelityFX input anti-aliasing for low-resolution optical flow.
+          +    # Leave OFF to produce the upstream-identical shader.
+          +    option(XRFG_EXPERIMENTAL_FFX_4TAP
+          +        "Prefilter low-resolution FidelityFX optical-flow input using four taps" OFF)
+          +    if(XRFG_EXPERIMENTAL_FFX_4TAP)
+          +        set(XRFG_PACK_FILTER_DEFINE /D XRFG_FLOW_PACK_4TAP=1)
+          +    else()
+          +        set(XRFG_PACK_FILTER_DEFINE)
+          +    endif()
+          +
+               set(XRFG_FIDELITYFX_INCLUDE_DIR
+          @@ -271,2 +271,3 @@
+                   COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E PackFlowInput
+          +            ${XRFG_PACK_FILTER_DEFINE}
+                       /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+          --- a/src/d3d12/frame_synthesis.hlsl
+          +++ b/src/d3d12/frame_synthesis.hlsl
+          @@ -614,4 +614,29 @@
+                   if (source_coordinate.y < float(Height)) {
+          -            current_color =
+          -                bilinear_current_source(source_coordinate, slice);
+          +#ifdef XRFG_FLOW_PACK_4TAP
+          +            // Experimental input prefilter for FidelityFX at <= 50% scale.
+          +            // One ordinary bilinear tap misses much of a 4x4 source footprint
+          +            // at 25% scale, making one-pixel cockpit strokes flicker in the
+          +            // flow field as the viewpoint moves by fractions of a pixel.
+          +            // Four quadrant samples approximate an area filter, at the price
+          +            // of extra texture reads in this low-resolution packing pass.
+          +            // This intentionally changes only the optical-flow INPUT, not
+          +            // the image displayed or the compositor's frame timing.
+          +            if (input_scale.x <= 0.501) {
+          +                float2 half_tap = float2(0.25, 0.25) / max(
+          +                    input_scale, float2(1.0e-6, 1.0e-6));
+          +                current_color = 0.25 * (
+          +                    bilinear_current_source(source_coordinate +
+          +                        float2(-half_tap.x, -half_tap.y), slice) +
+          +                    bilinear_current_source(source_coordinate +
+          +                        float2( half_tap.x, -half_tap.y), slice) +
+          +                    bilinear_current_source(source_coordinate +
+          +                        float2(-half_tap.x,  half_tap.y), slice) +
+          +                    bilinear_current_source(source_coordinate +
+          +                        float2( half_tap.x,  half_tap.y), slice));
+          +            } else
+          +#endif
+          +            {
+          +                current_color =
+          +                    bilinear_current_source(source_coordinate, slice);
+          +            }
+                   }
+          '@
+          # Write UTF-8 without BOM to preserve unified-diff hunk syntax.
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'experiment.patch'), $patch + "`n", (New-Object System.Text.UTF8Encoding($false)))
+          git apply --check experiment.patch
+          if ($LASTEXITCODE -ne 0) { throw 'Patch does not apply to pinned release' }
+          git apply experiment.patch
+          if ($LASTEXITCODE -ne 0) { throw 'Patch apply failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Patched source has whitespace errors' }
+          git diff --stat
+
+      - name: Cache the FidelityFX SDK libraries
+        id: ffx-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.FFX_ROOT }}/sdk/include
+            ${{ env.FFX_ROOT }}/sdk/bin/ffx_sdk
+          key: ffx-${{ env.FFX_COMMIT }}-of-dx12-static-vs2022-x64-v1
+
+      - name: Build FidelityFX SDK 1.1.4 when not cached
+        if: steps.ffx-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --branch $env:FFX_TAG --depth 1 `
+            https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git $env:FFX_ROOT
+          $head = (git -C $env:FFX_ROOT rev-parse HEAD).Trim()
+          if ($head -ne $env:FFX_COMMIT) { throw "FidelityFX tag moved: $head" }
+          cmake -S "$env:FFX_ROOT/sdk" -B build-fidelityfx -G "Visual Studio 17 2022" -A x64 `
+            -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX configure failed' }
+          cmake --build build-fidelityfx --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX build failed' }
+          foreach ($lib in 'ffx_backend_dx12_x64.lib', 'ffx_opticalflow_x64.lib') {
+            if (-not (Test-Path "$env:FFX_ROOT/sdk/bin/ffx_sdk/$lib")) { throw "Missing $lib" }
+          }
+
+      - name: Fetch pinned NVIDIA DLSS headers
+        shell: pwsh
+        env:
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git -c advice.detachedHead=false clone --branch $env:DLSS_TAG --depth 1 `
+            --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
+          if ($LASTEXITCODE -ne 0) { throw 'DLSS clone failed' }
+          git -C external/DLSS sparse-checkout set include
+          $head = (git -C external/DLSS rev-parse HEAD).Trim()
+          if ($head -ne $env:DLSS_COMMIT) { throw "DLSS tag moved: $head" }
+          if (-not (Test-Path external/DLSS/include/nvsdk_ngx_params.h)) { throw 'Missing NGX headers' }
+
+      - name: Fetch pinned OpenVR header
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force external/openvr | Out-Null
+          curl.exe -fsSL -o external/openvr/openvr.h `
+            "https://raw.githubusercontent.com/ValveSoftware/openvr/$env:OPENVR_TAG/headers/openvr.h"
+          if ($LASTEXITCODE -ne 0) { throw 'OpenVR header download failed' }
+          $hash = (Get-FileHash external/openvr/openvr.h -Algorithm SHA256).Hash
+          if ($hash -ne $env:OPENVR_SHA256) { throw "OpenVR checksum mismatch: $hash" }
+
+      - name: Find Windows fxc shader compiler
+        id: fxc
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\fxc.exe' -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'No fxc.exe found in Windows SDK' }
+          "path=$($fxc.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Using: $($fxc.FullName)"
+
+      - name: Configure experimental shader build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DXRFG_FXC_EXECUTABLE="${{ steps.fxc.outputs.path }}" `
+            -DXRFG_EXPERIMENTAL_FFX_4TAP=ON
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+          $cache = Get-Content build/CMakeCache.txt
+          if (-not ($cache | Select-String 'XRFG_EXPERIMENTAL_FFX_4TAP:BOOL=ON')) {
+            throw 'Experimental shader flag not ON'
+          }
+
+      - name: Build 64-bit Windows executables and DLLs
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+
+      - name: Run Windows software-renderer tests
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure --timeout 300 -LE needs_gpu_timing
+          if ($LASTEXITCODE -ne 0) { throw 'At least one test failed: no release artifact will be uploaded' }
+
+      - name: Package unsigned experiment and checksums
+        shell: pwsh
+        run: |
+          $out = 'dist/OFXR-Pico4-VDXR-FFX4Tap-V577-UNSIGNED'
+          New-Item -ItemType Directory -Force "$out/ofxr", "$out/licenses", `
+            "$out/external/OpenXR-SDK/LICENSES", "$out/external/Vulkan-Headers" | Out-Null
+          Copy-Item build/Release/OFXRBridgeTray.exe $out
+          Copy-Item build/Release/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll, `
+            build/Release/ofxr/OFXR_vulkan_queue_layer.dll, `
+            build/Release/ofxr/ofxr_bridge.ini "$out/ofxr"
+          Copy-Item README.md, LICENSE, THIRD_PARTY.md $out
+          Copy-Item licenses/* "$out/licenses"
+          Copy-Item external/OpenXR-SDK/LICENSES/* "$out/external/OpenXR-SDK/LICENSES"
+          Copy-Item external/Vulkan-Headers/LICENSE.md "$out/external/Vulkan-Headers"
+          @'
+          EXPERIMENTAL/UNSIGNED build: NOT the official signed OFXR release.
+          Pinned base: djules75/OFXR-Bridge 0.2.14.3 (V577), commit 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e.
+          Change: four-tap prefilter for <=50% FidelityFX flow input. CMake option XRFG_EXPERIMENTAL_FFX_4TAP=ON.
+          Tested by CI: Windows x64 build and WARP/CPU tests, not Pico 4 or RX 7900 XTX.
+          Run on your PC at your own risk. Do NOT mix versions or run game elevated.
+          For accurate A/B: exit MSFS, disarm and exit any old tray; extract this entire folder separately;
+          run its OFXRBridgeTray.exe before launching MSFS, and disable Virtual Desktop SSW.
+          DO NOT disable antivirus or SmartScreen to force execution if the file is blocked.
+          '@ | Set-Content -Encoding utf8 "$out/EXPERIMENT_README.txt"
+          Copy-Item experiment.patch "$out/experiment.patch"
+          $checksums = Get-ChildItem $out -File -Recurse |
+            Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
+            Sort-Object FullName | ForEach-Object {
+              $rel = $_.FullName.Substring((Resolve-Path $out).Path.Length + 1).Replace('\','/')
+              '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $rel
+            }
+          $checksums | Set-Content -Encoding ascii "$out/SHA256SUMS.txt"
+          if (-not (Test-Path "$out/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll")) { throw 'Missing runtime layer DLL' }
+          Write-Host "Packaged to $out"
+
+      - name: Upload ready-to-extract Windows experimental build
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-Pico4-VDXR-FFX4Tap-V577-UNSIGNED
+          path: dist/OFXR-Pico4-VDXR-FFX4Tap-V577-UNSIGNED
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostic logs if build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-Pico4-experiment-failed-build-logs
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/Testing/Temporary/*.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
