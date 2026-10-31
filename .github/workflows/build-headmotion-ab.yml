@@ -1,0 +1,395 @@
+name: OFXR Pico4 VDXR head-motion A-B V577
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_COMMIT: 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e
+  FFX_TAG: v1.1.4
+  FFX_COMMIT: c6efa6bf7f2027b3ec94f28578bb5965eabb9e55
+  FFX_ROOT: external/FidelityFX-SDK-v1.1.4
+  DLSS_TAG: v310.9.1
+  DLSS_COMMIT: 374959484e79a640feaba44c93ac8cfb0a03f5b5
+  OPENVR_TAG: v2.5.1
+  OPENVR_SHA256: 94E5545370159C85F87CD6E15DD3739F7C919FC7A6E869F5E4ED463533A07ED0
+
+jobs:
+  experimental-build:
+    name: Windows x64 build, test and package
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out exact upstream 0.2.14.3 (V577)
+        uses: actions/checkout@v4
+        with:
+          repository: djules75/OFXR-Bridge
+          ref: 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e
+          persist-credentials: false
+
+      - name: Verify upstream commit
+        shell: pwsh
+        run: |
+          $hash = (git rev-parse HEAD).Trim()
+          if ($hash -ne $env:UPSTREAM_COMMIT) { throw "Unexpected upstream commit: $hash" }
+          Write-Host "Pinned upstream: $hash"
+
+      - name: Apply head-motion A/B shader experiments (strict pinned anchors)
+        shell: pwsh
+        run: |
+          # Embedded build script: one workflow file is all the fork needs.
+          @'
+          #!/usr/bin/env python3
+          """Idempotence-intolerant, fail-closed transformations for pinned OFXR V577.
+
+          Call only after verifying the upstream commit; no fuzzy patch matching.
+          Provides 0=stock reconstruction, 1=pose-held B camera, 2=confidence/edge guard.
+          """
+          from __future__ import annotations
+          from pathlib import Path
+          import re
+
+          ROOT = Path(__file__).resolve().parent if (Path(__file__).resolve().parent / 'CMakeLists.txt').exists() else Path.cwd()
+          CMAKE = ROOT / 'CMakeLists.txt'
+          SHADER = ROOT / 'src/d3d12/frame_synthesis.hlsl'
+
+
+          def replace_one(text: str, old: str, new: str, label: str) -> str:
+              n = text.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{label}: expected exactly one matching V577 anchor, found {n}')
+              return text.replace(old, new, 1)
+
+
+          def patch() -> None:
+              c = CMAKE.read_text(encoding='utf-8')
+              h = SHADER.read_text(encoding='utf-8')
+              c = replace_one(
+                  c,
+                  'if(WIN32 AND XRFG_BUILD_LAYER)\n',
+                  '''# Head-motion A/B builds. Stock remains the default and changes only PS shader defines.
+          set(XRFG_HEAD_MOTION_MODE "0" CACHE STRING "0=V577 stock, 1=pose-held B frame, 2=edge confidence guard")
+          set_property(CACHE XRFG_HEAD_MOTION_MODE PROPERTY STRINGS 0 1 2)
+          if(NOT XRFG_HEAD_MOTION_MODE MATCHES "^[012]$")
+              message(FATAL_ERROR "XRFG_HEAD_MOTION_MODE must be 0, 1, or 2")
+          endif()
+          set(XRFG_HEAD_MOTION_DEFINE /D XRFG_HEAD_MOTION_MODE=${XRFG_HEAD_MOTION_MODE})
+
+          if(WIN32 AND XRFG_BUILD_LAYER)
+          ''',
+                  'CMake experiment option',
+              )
+              shader_cmd = re.compile(r'(^[ \t]*COMMAND "\$\{XRFG_FXC_EXECUTABLE\}" /nologo /T ps_5_1 /E [A-Za-z0-9_]+\n)', re.M)
+              n = len(shader_cmd.findall(c))
+              if n < 8 or n > 25:
+                  raise RuntimeError(f'Unexpected number of pixel shader fxc commands: {n}')
+              c = shader_cmd.sub(r'\g<1>            ${XRFG_HEAD_MOTION_DEFINE}\n', c)
+              h = replace_one(
+                  h,
+                  'float4 synthesize_midpoint(\n',
+                  '''// Experimental compile-time diagnostic variants. The default is untouched V577.
+          #ifndef XRFG_HEAD_MOTION_MODE
+          #define XRFG_HEAD_MOTION_MODE 0
+          #endif
+          #if XRFG_HEAD_MOTION_MODE < 0 || XRFG_HEAD_MOTION_MODE > 2
+          #error Unsupported XRFG_HEAD_MOTION_MODE
+          #endif
+
+          float4 synthesize_midpoint(
+          ''',
+                  'HLSL mode declaration',
+              )
+              h = replace_one(
+                  h,
+                  '''                    } else {
+          #ifdef XRFG_HYBRID
+                                  // The hybrid's FidelityFX flow, by the same rule (V502).
+                                  confidence = saturate(1.0 + (stable_disagreement - disagreement) * hybrid_flow_rule_slope());
+          #endif
+                                  output_color = saturate(lerp(
+                                      stable_midpoint,
+                                      flow_midpoint,
+                                      confidence));
+          #ifdef XRFG_HYBRID
+                                  last_disagreement = lerp(stable_disagreement, compared, confidence);
+          #endif
+                              }
+          ''',
+                  '''                    } else {
+          #ifdef XRFG_HYBRID
+                                  // The hybrid's FidelityFX flow, by the same rule (V502).
+                                  confidence = saturate(1.0 + (stable_disagreement - disagreement) * hybrid_flow_rule_slope());
+          #endif
+                                  output_color = saturate(lerp(
+                                      stable_midpoint,
+                                      flow_midpoint,
+                                      confidence));
+          #if XRFG_HEAD_MOTION_MODE == 2
+                                  // EXPERIMENT: keep sharp B-frame structures when optical-flow
+                                  // endpoints disagree and B contains a strong local edge.
+                                  // The camera pose already maps A to B; B is later
+                                  // reprojected by the OpenXR compositor, not moved here.
+                                  // Guard only ambiguous high-contrast pixels to avoid
+                                  // changing the bulk of the ordinary flow result.
+                                  if (current_fallback.valid >= 0.5 &&
+                                      previous_at_pixel.valid >= 0.5) {
+                                      CameraSample right = sample_current_target(
+                                          pixel + float2(1.0, 0.0), Slice, ViewIndex);
+                                      CameraSample down = sample_current_target(
+                                          pixel + float2(0.0, 1.0), Slice, ViewIndex);
+                                      float edge_strength = 0.0;
+                                      if (right.valid >= 0.5) {
+                                          edge_strength = max(edge_strength,
+                                              rgb_error(current_fallback.color, right.color));
+                                      }
+                                      if (down.valid >= 0.5) {
+                                          edge_strength = max(edge_strength,
+                                              rgb_error(current_fallback.color, down.color));
+                                      }
+                                      float pose_pixels = length(previous_coverage.coordinate - pixel);
+                                      float pose_priority = lerp(0.3, 1.0,
+                                          smoothstep(0.5, 5.0, pose_pixels));
+                                      float guard = pose_priority *
+                                          smoothstep(0.08, 0.24, edge_strength) *
+                                          smoothstep(0.10, 0.30, disagreement) *
+                                          smoothstep(0.06, 0.28,
+                                              rgb_error(flow_midpoint, current_fallback.color));
+                                      output_color = saturate(lerp(
+                                          output_color, current_fallback.color, 0.75 * guard));
+                                  }
+          #endif
+          #ifdef XRFG_HYBRID
+                                  last_disagreement = lerp(stable_disagreement, compared, confidence);
+          #endif
+                              }
+          ''',
+                  'FidelityFX branch',
+              )
+              # Place the diagnostic hold at the very end: no optical-flow, HUD or tint
+              # can overwrite it. VDXR receives B's original pose and performs its usual
+              # last-moment warp. No new poses or projection metadata are invented.
+              h = replace_one(
+                  h,
+                  '''    return output_color;
+          }
+
+          #ifdef XRFG_HYBRID
+          // The game's vectors and the optical flow both: per pixel, whichever
+          ''',
+                  '''#if XRFG_HEAD_MOTION_MODE == 1
+              // DIAGNOSTIC ONLY: submit the most recent real B-camera pixels in each
+              // synthetic slot. Expect 24 Hz scene judder; this isolates image motion
+              // reconstruction from VDXR scheduling and final head-pose reprojection.
+              if (in_bounds) {
+                  output_color = saturate(sample_current_target(
+                      float2(integer_pixel), Slice, ViewIndex).color);
+              }
+          #endif
+              return output_color;
+          }
+
+          #ifdef XRFG_HYBRID
+          // The game's vectors and the optical flow both: per pixel, whichever
+          ''',
+                  'final diagnostic pose hold',
+              )
+              CMAKE.write_text(c, encoding='utf-8', newline='\n')
+              SHADER.write_text(h, encoding='utf-8', newline='\n')
+              print(f'Applied head-motion A/B transform: {n} pixel shaders with explicit mode define')
+
+
+          if __name__ == '__main__':
+              patch()
+          '@ | Set-Content -Path apply_headmotion_experiment.py -Encoding utf8
+          python apply_headmotion_experiment.py
+          if ($LASTEXITCODE -ne 0) { throw 'Source transformation failed (pinned V577 mismatch)' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Patched source contains whitespace errors' }
+          $diff = git diff -- CMakeLists.txt src/d3d12/frame_synthesis.hlsl
+          # Binary-free patch for review in the downloadable build.
+          $diff | Set-Content -Path headmotion_AB_V577.patch -Encoding utf8
+          if (-not (Test-Path headmotion_AB_V577.patch)) { throw 'No experiment patch generated' }
+          Write-Host 'Changed source:'
+          git diff --stat
+
+      - name: Cache the FidelityFX SDK libraries
+        id: ffx-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.FFX_ROOT }}/sdk/include
+            ${{ env.FFX_ROOT }}/sdk/bin/ffx_sdk
+          key: ffx-${{ env.FFX_COMMIT }}-of-dx12-static-vs2022-x64-v1
+
+      - name: Build FidelityFX SDK 1.1.4 when not cached
+        if: steps.ffx-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --branch $env:FFX_TAG --depth 1 `
+            https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git $env:FFX_ROOT
+          $head = (git -C $env:FFX_ROOT rev-parse HEAD).Trim()
+          if ($head -ne $env:FFX_COMMIT) { throw "FidelityFX tag moved: $head" }
+          cmake -S "$env:FFX_ROOT/sdk" -B build-fidelityfx -G "Visual Studio 17 2022" -A x64 `
+            -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX configure failed' }
+          cmake --build build-fidelityfx --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX build failed' }
+          foreach ($lib in 'ffx_backend_dx12_x64.lib', 'ffx_opticalflow_x64.lib') {
+            if (-not (Test-Path "$env:FFX_ROOT/sdk/bin/ffx_sdk/$lib")) { throw "Missing $lib" }
+          }
+
+      - name: Fetch pinned NVIDIA DLSS headers
+        shell: pwsh
+        env:
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git -c advice.detachedHead=false clone --branch $env:DLSS_TAG --depth 1 `
+            --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
+          if ($LASTEXITCODE -ne 0) { throw 'DLSS clone failed' }
+          git -C external/DLSS sparse-checkout set include
+          $head = (git -C external/DLSS rev-parse HEAD).Trim()
+          if ($head -ne $env:DLSS_COMMIT) { throw "DLSS tag moved: $head" }
+          if (-not (Test-Path external/DLSS/include/nvsdk_ngx_params.h)) { throw 'Missing NGX headers' }
+
+      - name: Fetch pinned OpenVR header
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force external/openvr | Out-Null
+          curl.exe -fsSL -o external/openvr/openvr.h `
+            "https://raw.githubusercontent.com/ValveSoftware/openvr/$env:OPENVR_TAG/headers/openvr.h"
+          if ($LASTEXITCODE -ne 0) { throw 'OpenVR header download failed' }
+          $hash = (Get-FileHash external/openvr/openvr.h -Algorithm SHA256).Hash
+          if ($hash -ne $env:OPENVR_SHA256) { throw "OpenVR checksum mismatch: $hash" }
+
+      - name: Find original Microsoft fxc shader compiler
+        id: fxc
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\fxc.exe' -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'No fxc.exe found in Windows SDK' }
+          "path=$($fxc.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Using: $($fxc.FullName)"
+
+      - name: Build and test all three shader variants separately
+        shell: pwsh
+        run: |
+          $modes = @(
+            @{ Name = '01-stock'; Number = 0 },
+            @{ Name = '02-pose-hold'; Number = 1 },
+            @{ Name = '03-edge-guard'; Number = 2 }
+          )
+          $shaderHashes = @{}
+          foreach ($mode in $modes) {
+            $modeName = $mode.Name
+            $number = $mode.Number
+            $build = 'build-ab'
+            Write-Host "========== $modeName (shader mode $number) =========="
+            if (Test-Path $build) { Remove-Item -Recurse -Force $build }
+            cmake -S . -B $build -G 'Visual Studio 17 2022' -A x64 `
+              -DXRFG_FXC_EXECUTABLE="${{ steps.fxc.outputs.path }}" `
+              -DXRFG_HEAD_MOTION_MODE="$number"
+            if ($LASTEXITCODE -ne 0) { throw "CMake failed: $modeName" }
+            if (-not (Select-String -Path "$build/CMakeCache.txt" `
+                -Pattern "XRFG_HEAD_MOTION_MODE:STRING=$number" -Quiet)) {
+              throw "Wrong CMake mode in $modeName"
+            }
+            cmake --build $build --config Release --parallel
+            if ($LASTEXITCODE -ne 0) { throw "Build failed: $modeName" }
+            $header = "$build/generated-shaders/synthesize_midpoint_pixel_shader.hpp"
+            if (-not (Test-Path $header)) { throw "Missing compiled FidelityFX synthesis shader: $modeName" }
+            $shaderHashes[$modeName] = (Get-FileHash $header -Algorithm SHA256).Hash
+            ctest --test-dir $build -C Release --output-on-failure --timeout 300 -LE needs_gpu_timing
+            if ($LASTEXITCODE -ne 0) { throw "Tests failed: $modeName" }
+            $out = "dist/OFXR-V577-HeadMotion-AB/$modeName"
+            New-Item -ItemType Directory -Force "$out/ofxr", "$out/licenses", `
+              "$out/external/OpenXR-SDK/LICENSES", "$out/external/Vulkan-Headers" | Out-Null
+            Copy-Item "$build/Release/OFXRBridgeTray.exe" $out
+            Copy-Item "$build/Release/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll", `
+              "$build/Release/ofxr/OFXR_vulkan_queue_layer.dll", `
+              "$build/Release/ofxr/ofxr_bridge.ini" "$out/ofxr"
+            Copy-Item README.md, LICENSE, THIRD_PARTY.md $out
+            Copy-Item licenses/* "$out/licenses"
+            Copy-Item external/OpenXR-SDK/LICENSES/* "$out/external/OpenXR-SDK/LICENSES"
+            Copy-Item external/Vulkan-Headers/LICENSE.md "$out/external/Vulkan-Headers"
+            @"
+          UNSIGNED experimental build, NOT an official OFXR release.
+          Variant: $modeName; mode=$number.
+          Original source: djules75/OFXR-Bridge V577 commit $env:UPSTREAM_COMMIT.
+          Mode 0 = stock V577 shader behavior; mode 1 = latest B image hold, diagnostic only;
+          mode 2 = confidence-based edge guard in FidelityFX synthesis.
+          Never combine variants, or enable Virtual Desktop SSW while OFXR is armed.
+          Not yet validated on actual Pico 4 hardware. Keep the official build as rollback.
+          "@ | Set-Content -Encoding utf8 "$out/VARIANT.txt"
+            if (-not (Test-Path "$out/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll")) {
+              throw "Missing experimental layer DLL: $modeName"
+            }
+            Write-Host "Built/tested/staged $modeName | shader SHA256 $($shaderHashes[$modeName])"
+            # Reclaim Windows runner disk space before building the next variant.
+            Remove-Item -Recurse -Force $build
+          }
+          if ($shaderHashes['01-stock'] -eq $shaderHashes['02-pose-hold'] -or `
+              $shaderHashes['01-stock'] -eq $shaderHashes['03-edge-guard'] -or `
+              $shaderHashes['02-pose-hold'] -eq $shaderHashes['03-edge-guard']) {
+            throw 'At least two variants compiled to identical FidelityFX shader bytecode'
+          }
+          $root = 'dist/OFXR-V577-HeadMotion-AB'
+          Copy-Item headmotion_AB_V577.patch "$root/experiment.patch"
+          Copy-Item apply_headmotion_experiment.py "$root/apply_headmotion_experiment.py"
+          @'
+          OFXR V577 HEAD-MOTION A/B COMPARISON (UNSIGNED)
+
+          01-stock: original V577 rendering (same pipeline, compile-time mode 0).
+          02-pose-hold: diagnostic, deliberately shows latest real B-camera image
+            in generated slots. Expect visibly jerky 24Hz scene motion. If the
+            DOUBLE EDGES disappear it implicates synthesis; if not, investigate
+            VDXR compositor presentation/pose timing or 24Hz hold behavior.
+          03-edge-guard: FidelityFX optical flow with low-confidence sharp-edge
+            fallback to the current real frame, weighted by camera pose change.
+            It may trade some smoothness or add flicker; not a proven fix.
+
+          Use same MSFS scene, same Virtual Desktop resolution, VDXR, 72 Hz,
+          3X and SSW OFF for all three. Run only one variant at a time.
+          CLOSE MSFS; disarm and exit previous OFXR tray; launch the next
+          variant's OFXRBridgeTray.exe; arm it; then launch MSFS. Do not mix
+          DLLs/INI versions. Do not run MSFS elevated. Preserve official
+          installation as rollback. CTest uses Windows software renderer,
+          NOT an actual Pico 4 and RX 7900 XTX. No source code signing.
+
+          Compare: head-turn doubling, cockpit vertical lines, runway stripes,
+          output FPS and actual native FPS (status.json), visual stutter.
+          02-pose-hold is diagnostic only; its perceived smoothness may be worse.
+          '@ | Set-Content -Encoding utf8 "$root/EXPERIMENT_README.txt"
+          $hashes = $shaderHashes.GetEnumerator() | Sort-Object Key | ForEach-Object {
+            "{0}  {1}" -f $_.Value, $_.Key
+          }
+          $hashes | Set-Content -Encoding ascii "$root/SHADER_SHA256.txt"
+          $checksums = Get-ChildItem $root -File -Recurse |
+            Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
+            Sort-Object FullName | ForEach-Object {
+              $rel = $_.FullName.Substring((Resolve-Path $root).Path.Length + 1).Replace('\','/')
+              '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $rel
+            }
+          $checksums | Set-Content -Encoding ascii "$root/SHA256SUMS.txt"
+          Write-Host 'All three shader bytecodes differ, Windows builds and tests passed.'
+
+      - name: Upload all three ready-to-extract comparison variants
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-V577-Pico4-VDXR-HeadMotion-AB-UNSIGNED
+          path: dist/OFXR-V577-HeadMotion-AB/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostic logs if build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-HeadMotion-AB-failed-build-logs
+          path: |
+            build-ab/Testing/Temporary/LastTest.log
+            build-ab/Testing/Temporary/*.log
+            build-ab/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
