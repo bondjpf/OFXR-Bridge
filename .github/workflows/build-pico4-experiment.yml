@@ -40,6 +40,7 @@ jobs:
         shell: pwsh
         run: |
           # The following patch is embedded: no untrusted patch download.
+          # v2: patch apply is tolerant of CRLF/LF mixtures on Windows.
           $patch = @'
           --- a/CMakeLists.txt
           +++ b/CMakeLists.txt
@@ -97,14 +98,29 @@ jobs:
           +            }
                    }
           '@
-          # Write UTF-8 without BOM to preserve unified-diff hunk syntax.
-          [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'experiment.patch'), $patch + "`n", (New-Object System.Text.UTF8Encoding($false)))
-          git apply --check experiment.patch
-          if ($LASTEXITCODE -ne 0) { throw 'Patch does not apply to pinned release' }
-          git apply experiment.patch
+          # FIX v2: PowerShell here-strings use CRLF on Windows, while some
+          # checked-out source files use LF. Plain git apply requires their
+          # context-line terminators to match and fails on frame_synthesis.hlsl.
+          # Use LF in the patch and tolerate checkout line-ending differences.
+          $patch = $patch.Replace("`r`n", "`n").Replace("`r", "`n")
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location) 'experiment.patch'),
+            $patch + "`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+          git apply --ignore-space-change --check experiment.patch
+          if ($LASTEXITCODE -ne 0) { throw 'Patch does not apply to pinned release (line-ending-tolerant)' }
+          git apply --ignore-space-change experiment.patch
           if ($LASTEXITCODE -ne 0) { throw 'Patch apply failed' }
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw 'Patched source has whitespace errors' }
+          # Ensure the intended shader and CMake options are actually present.
+          if (-not (Select-String -Path src/d3d12/frame_synthesis.hlsl -Pattern '^#ifdef XRFG_FLOW_PACK_4TAP$' -Quiet)) {
+            throw 'Experimental HLSL change missing after applying patch'
+          }
+          if (-not (Select-String -Path CMakeLists.txt -Pattern 'option\(XRFG_EXPERIMENTAL_FFX_4TAP' -Quiet)) {
+            throw 'Experimental CMake option missing after applying patch'
+          }
+          Write-Host 'Patched files:'
           git diff --stat
 
       - name: Cache the FidelityFX SDK libraries
