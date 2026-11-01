@@ -1,4 +1,4 @@
-name: OFXR V577 Presenter vs Synthetic Image Isolation (security audit)
+name: OFXR V577 Presenter Isolation V3 (preflight + security audit)
 
 on:
   workflow_dispatch:
@@ -104,8 +104,8 @@ jobs:
                       }
                       if (synthetic) {
                           // The V008 shader generates the synthetic image in B's camera'''
-          APP_PROCESS_ANCHOR = '[[nodiscard]] bool build_generated_frame_end_info(' 
-          DIAG_PROCESS_HELPER = '''// Experiment isolated to the real simulator process. CTest mock applications
+          APP_PROCESS_ANCHOR = '[[nodiscard]] std::shared_ptr<GeneratedFrameEndInfo>\nmake_presenter_owned_frame('
+          DIAG_PROCESS_HELPER = r'''// Experiment isolated to the real simulator process. CTest mock applications
           // must retain V577 pairing, GPU outputs, presentation and lifetime semantics.
           // Checking the loaded process name also keeps these diagnostic DLLs harmless
           // to other OpenXR applications if the API layer is registered globally.
@@ -232,7 +232,7 @@ jobs:
                   return
           
               def patch_app(content: str) -> str:
-                  content = replace_once(content, APP_PROCESS_ANCHOR, DIAG_PROCESS_HELPER + APP_PROCESS_ANCHOR, 'MSFS-only process gate')
+                  content = replace_once(content, APP_PROCESS_ANCHOR, DIAG_PROCESS_HELPER + APP_PROCESS_ANCHOR, 'MSFS-only process gate before first call')
                   content = replace_once(content, OWNER_COUNTER_ANCHOR, OWNER_COUNTER_REPLACEMENT, 'owner sampling start')
                   content = replace_once(content, OWN_ANCHOR, OWN_REPLACE, 'owner chains trace')
                   content = replace_once(content, META_START,
@@ -253,6 +253,14 @@ jobs:
                   return content
           
               edit(app, patch_app)
+              # Fail before MSVC compilation if a source change moved our helper
+              # below its earliest call, or if Python mangled the Windows path literal.
+              patched_app = app.read_text(encoding='utf-8')
+              helper_position = patched_app.index('[[nodiscard]] bool xrfg_diag_is_msfs_process()')
+              first_use_position = patched_app.index('xrfg_diag_is_msfs_process()', helper_position + 1)
+              assert helper_position < first_use_position, 'Diagnostic function declared after first use'
+              assert "L'\\\\'" in patched_app, 'Invalid C++ Windows path separator literal'
+              assert "L'\\'" not in patched_app, 'Invalid unescaped C++ character literal'
               if args.mode == 'direct-current':
                   def patch_synth(content: str) -> str:
                       content = replace_once(content, SYNTH_FUNC_ANCHOR,
@@ -273,6 +281,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Source patcher syntax invalid' }
           python apply_diagnostic.py --root . --mode stock
           if ($LASTEXITCODE -ne 0) { throw 'Pinned source anchors changed' }
+          # Syntax guard for the exact emitted C++ helper. This caught the V2
+          # unterminated L'\' character literal before any expensive build.
+          @'
+          from apply_diagnostic import DIAG_PROCESS_HELPER, APP_PROCESS_ANCHOR
+          assert APP_PROCESS_ANCHOR.startswith('[[nodiscard]] std::shared_ptr<GeneratedFrameEndInfo>')
+          sep = chr(92)
+          assert ("L'" + sep*2 + "'") in DIAG_PROCESS_HELPER
+          assert ("L'" + sep + "'") not in DIAG_PROCESS_HELPER
+          print('PASS: process helper precedes presenter owner; valid Windows path literal')
+          '@ | Set-Content -Path validate_cpp_gate.py -Encoding utf8
+          python validate_cpp_gate.py
+          if ($LASTEXITCODE -ne 0) { throw 'Generated C++ helper validation failed' }
 
       - name: Cache the FidelityFX SDK libraries
         id: ffx-cache
@@ -351,6 +371,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Patch refused: $mode" }
             git diff --check
             if ($LASTEXITCODE -ne 0) { throw "Source diff error: $mode" }
+            # Apply-time contract checks are inside apply_diagnostic.py and
+            # validate helper position/escaping before MSVC sees the file.
+            $source = Get-Content src/layer/openxr_layer.cpp -Raw
+            if ($mode -ne '01-stock' -and
+                $source.IndexOf('[[nodiscard]] bool xrfg_diag_is_msfs_process()') -lt 0) {
+              throw "Missing process guard in $mode"
+            }
             $out = "$root/$mode"
             New-Item -ItemType Directory -Force "$out/ofxr", "$out/licenses", `
               "$out/external/OpenXR-SDK/LICENSES", "$out/external/Vulkan-Headers" | Out-Null
@@ -368,7 +395,7 @@ jobs:
             # Do NOT exclude broad categories of expected failures.
             & ctest --test-dir $build -C Release --output-on-failure `
                 --timeout 300 -LE needs_gpu_timing | Tee-Object -FilePath $tests
-            if ($LASTEXITCODE -ne 0) { throw "FULL CTest regression: $mode" }
+            if ($LASTEXITCODE -ne 0) { throw "CTest regression ($mode)" }
             Copy-Item "$build/Release/OFXRBridgeTray.exe" $out
             Copy-Item "$build/Release/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll", `
               "$build/Release/ofxr/OFXR_vulkan_queue_layer.dll", `
@@ -403,7 +430,7 @@ jobs:
           ## Experiments
           01-stock: unmodified upstream V577.
           All diagnostic effects are gated on executable FlightSimulator2024.exe.
-          The FULL upstream CTest suite must pass in each variant.
+          All upstream CI-eligible CTests must pass in each variant (GPU-timing label excluded).
           02-presenter-only: force prime instead of pairing so only the real B
           image is copied into the owned current swapchain and submitted; the
           presenter repeats the last valid owned image in empty 72 Hz slots.
@@ -520,4 +547,6 @@ jobs:
             build-diagnostic-*/Testing/Temporary/LastTest.log
             build-diagnostic-*/Testing/Temporary/*.log
             build-diagnostic-*/CMakeFiles/CMakeConfigureLog.yaml
+            dist/OFXR-V577-Presenter-Isolation/*/SOURCE_CHANGE.patch
+            dist/OFXR-V577-Presenter-Isolation/*/TESTS.txt
           if-no-files-found: ignore
