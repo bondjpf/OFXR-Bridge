@@ -1,0 +1,720 @@
+name: OFXR V577 Motion-Reconstruction 3X (full regression + Defender)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_COMMIT: 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e
+  FFX_TAG: v1.1.4
+  FFX_COMMIT: c6efa6bf7f2027b3ec94f28578bb5965eabb9e55
+  FFX_ROOT: external/FidelityFX-SDK-v1.1.4
+  DLSS_TAG: v310.9.1
+  DLSS_COMMIT: 374959484e79a640feaba44c93ac8cfb0a03f5b5
+  OPENVR_TAG: v2.5.1
+  OPENVR_SHA256: 94E5545370159C85F87CD6E15DD3739F7C919FC7A6E869F5E4ED463533A07ED0
+
+jobs:
+  experimental-build:
+    name: Windows x64 build, test and package
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out exact upstream 0.2.14.3 (V577)
+        uses: actions/checkout@v4
+        with:
+          repository: djules75/OFXR-Bridge
+          ref: 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e
+          persist-credentials: false
+
+      - name: Verify upstream commit
+        shell: pwsh
+        run: |
+          $hash = (git rev-parse HEAD).Trim()
+          if ($hash -ne $env:UPSTREAM_COMMIT) { throw "Unexpected upstream commit: $hash" }
+          Write-Host "Pinned upstream: $hash"
+
+      - name: Install pinned MSFS motion-reconstruction sources and run math tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          #!/usr/bin/env python3
+          """Fail-closed patch for pinned OFXR V577. AMD/TAA 3X MSFS-only.
+          
+          A: synthesised projection position is interpolated A->B; the stock shader
+          already removes camera rotation, so its B orientation/FOV are retained.
+          B: FFX flow gets edge-local image correspondence refinement with a 3D
+          parallax validation inferred from camera baseline and binocular-style
+          monocular two-time correspondences. No proprietary/engine depth is assumed.
+          C: layered failure handling; no scheduler/presenter/swapchain changes.
+          """
+          from __future__ import annotations
+          import argparse
+          from pathlib import Path
+          
+          PINNED='0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e'
+          APP='src/layer/openxr_layer.cpp'
+          SYNTH='src/d3d12/d3d12_frame_synthesizer.cpp'
+          SHADER='src/d3d12/frame_synthesis.hlsl'
+          
+          def once(s, old, new, label):
+              count=s.count(old)
+              if count!=1: raise RuntimeError(f'FAIL CLOSED {label}: expected once, found {count}')
+              return s.replace(old,new,1)
+          
+          GATE=r'''// Standalone process gate: no additional API layer changes in tests or games.
+          [[nodiscard]] bool xrfg_recon_msfs() noexcept {
+              static const bool enabled = []() noexcept {
+                  wchar_t path[MAX_PATH]{};
+                  const DWORD n=GetModuleFileNameW(nullptr,path,MAX_PATH);
+                  if (n==0 || n>=MAX_PATH) return false;
+                  const wchar_t* name=path;
+                  for (DWORD i=0;i<n;++i) if (path[i]==92 || path[i]==47) name=path+i+1;
+                  return CompareStringOrdinal(name,-1,L"FlightSimulator2024.exe",-1,TRUE)==CSTR_EQUAL;
+              }();
+              return enabled;
+          }
+          
+          '''
+          
+          APP_FUNC='''[[nodiscard]] bool build_generated_frame_end_info(
+              const XrFrameEndInfo* source,
+              const ProjectionSnapshot& current_snapshot,
+              bool synthetic,
+              std::span<const ProjectionResourceDestination> destinations,
+              GeneratedFrameEndInfo* output) {'''
+          APP_FUNC_NEW='''[[nodiscard]] bool build_generated_frame_end_info(
+              const XrFrameEndInfo* source,
+              const ProjectionSnapshot& current_snapshot,
+              bool synthetic,
+              std::span<const ProjectionResourceDestination> destinations,
+              GeneratedFrameEndInfo* output,
+              const ProjectionSnapshot* previous_snapshot = nullptr,
+              float fraction = 1.0F) {'''
+          APP_ANCHOR='''            view.subImage.swapchain = destination->destination_swapchain;
+                      if (synthetic) {
+                          // The V008 shader generates the synthetic image in B's camera'''
+          APP_NEW='''            view.subImage.swapchain = destination->destination_swapchain;
+                      if (synthetic && xrfg_recon_msfs() && previous_snapshot != nullptr &&
+                          fraction > 0.05F && fraction < 0.95F &&
+                          projection_index < previous_snapshot->layers.size() &&
+                          previous_snapshot->layers[projection_index].space == metadata.space &&
+                          previous_snapshot->layers[projection_index].layer_index == metadata.layer_index &&
+                          view_index < previous_snapshot->layers[projection_index].views.size()) {
+                          const auto& prev = previous_snapshot->layers[projection_index].views[view_index];
+                          const XrVector3f a=prev.pose.position;
+                          const XrVector3f b=view.pose.position;
+                          const float dx=b.x-a.x, dy=b.y-a.y, dz=b.z-a.z;
+                          const float baseline2=dx*dx+dy*dy+dz*dz;
+                          // Reject tracking resets, invalid poses and non-finite fractions.
+                          // The FidelityFX source is already rotation-compensated into
+                          // B. Its motion residual interpolates parallax A->B, so the
+                          // synthetic OpenXR view needs the corresponding POSITION,
+                          // while its ORIENTATION and FOV must remain B's.
+                          if (std::isfinite(baseline2) && baseline2 < 0.0625F &&
+                              baseline2 > 1.0e-10F) {
+                              view.pose.position={a.x+fraction*dx,a.y+fraction*dy,a.z+fraction*dz};
+                              static std::atomic<std::uint64_t> samples{0};
+                              if (view_index==0 &&
+                                  samples.fetch_add(1,std::memory_order_relaxed)%90==0) {
+                                  // 994: a=fraction ppm; b=baseline micrometres;
+                                  // c=1 position interpolated, B orientation kept.
+                                  xrfg::bridge_flight_logger().event(
+                                      xrfg::BridgeFlightOperation::presenter_transition,
+                                      994,
+                                      static_cast<std::uint64_t>(fraction*1000000.0F),
+                                      static_cast<std::uint64_t>(std::sqrt(baseline2)*1000000.0F),
+                                      1U);
+                              }
+                          }
+                      }
+                      if (synthetic) {
+                          // The V008 shader generates the synthetic image in B's camera'''
+          
+          SYNTH_ANCHOR='''}  // namespace
+          
+          struct D3D12FrameSynthesizer::Impl {'''
+          SYNTH_SUPPORT=r'''// Relative B minus A camera translation expressed in B's axes. For
+          // FidelityFX only: game-motion constants are zero/unused in this route.
+          [[nodiscard]] std::array<float,3> xrfg_recon_camera_baseline(
+              const D3D12ReprojectionView& a,
+              const D3D12ReprojectionView& b) noexcept {
+              const Quaternion q=normalize(b.pose.orientation);
+              const Quaternion inverse{-q.x,-q.y,-q.z,q.w};
+              const Quaternion delta{b.pose.position.x-a.pose.position.x,
+                  b.pose.position.y-a.pose.position.y,
+                  b.pose.position.z-a.pose.position.z,0.0F};
+              const Quaternion local=multiply(multiply(inverse,delta),q);
+              const float length2=local.x*local.x+local.y*local.y+local.z*local.z;
+              if (!std::isfinite(length2) || length2>=0.0625F || length2<1.0e-10F)
+                  return {0.0F,0.0F,0.0F};
+              return {local.x,local.y,local.z};
+          }
+          
+          '''
+          # The standard fidelityFX path populates root constants, and the draw's
+          # per-output flag remap keeps bit30 via & 0xFF0000FFU. No new descriptors.
+          SYNTH_MASK='''        parameters.synthesis_flags |=
+                      record_still_mask(slot, slot.command_list.Get(), parameters, target_views, guides, false);
+                  // V546: the eye order of two streams nothing else tells apart.'''
+          SYNTH_MASK_NEW='''        parameters.synthesis_flags |=
+                      record_still_mask(slot, slot.command_list.Get(), parameters, target_views, guides, false);
+                  // Motion-parallax model: pack A->B baseline into otherwise UNUSED
+                  // game-motion root constants. ONLY FFX without DLSS guides and only
+                  // MSFS; the 62-DWORD root-signature ABI is unchanged. Flat panels
+                  // do not share projection geometry and stay on V577 stock.
+                  if (xrfg_recon_msfs() && guides==nullptr && !flat_panel &&
+                      !target_views.empty() && target_views.size()<=2U &&
+                      previous_source.view_count>=target_views.size() &&
+                      current_source.view_count>=target_views.size()) {
+                      const auto baseline0=xrfg_recon_camera_baseline(
+                          previous_source.views[0],current_source.views[0]);
+                      parameters.game_motion_rect={baseline0[0],baseline0[1],baseline0[2],0.0F};
+                      if (target_views.size()>1U) {
+                          const auto baseline1=xrfg_recon_camera_baseline(
+                              previous_source.views[1],current_source.views[1]);
+                          parameters.game_motion_scale={baseline1[0],baseline1[1]};
+                          parameters.game_motion_jitter_delta[0]=baseline1[2];
+                      }
+                      parameters.game_motion_jitter_delta[1]=1.0F;
+                      parameters.synthesis_flags|=(1U<<30U);
+                      static std::atomic<std::uint64_t> recon_pairs{0};
+                      if (recon_pairs.fetch_add(1,std::memory_order_relaxed)%120==0) {
+                          // 995: a=baseline micrometres (eye 0), b=views,
+                          // c=1 means FFX parallax/edge path on this pair.
+                          xrfg::bridge_flight_logger().event(
+                              xrfg::BridgeFlightOperation::embedded_configuration,995,
+                              static_cast<std::uint64_t>(std::sqrt(
+                                  baseline0[0]*baseline0[0]+baseline0[1]*baseline0[1]+
+                                  baseline0[2]*baseline0[2])*1000000.0F),
+                              static_cast<std::uint64_t>(target_views.size()),1U);
+                      }
+                  }
+                  // V546: the eye order of two streams nothing else tells apart.'''
+          
+          # Insert after flow_for_pixel (must be declared before use); after
+          # forward_flow_for_pixel and helpers? place immediately BEFORE synthesize_midpoint
+          # so all color/flow and geometric helpers are declared already.
+          SHADER_ENTRY='''float4 synthesize_midpoint(
+              FullscreenVertex input,'''
+          SHADER_HELPERS=r'''// AMD FidelityFX MSFS 3X motion reconstruction: camera-baseline-derived
+          // depth from image correspondences, edge-local refinement and occlusion
+          // confidence. This is intentionally *not* a fake OpenXR depth attachment.
+          // Zero-baseline/degenerate rays revert to the original optical flow.
+          bool xrfg_recon_enabled() {
+              return (SynthesisFlags & (1u<<30u))!=0u &&
+                  GameMotionJitterDelta.y>0.5 && !flat_panel();
+          }
+          float3 xrfg_recon_baseline(uint eye) {
+              return eye==0u ? GameMotionRect.xyz :
+                  float3(GameMotionScale.xy,GameMotionJitterDelta.x);
+          }
+          float2 xrfg_recon_tangent(float2 p,float4 rect,float4 tangents) {
+              float2 uv=(p-rect.xy+0.5)/max(rect.zw,float2(1.0,1.0));
+              return float2(lerp(tangents.x,tangents.y,uv.x),
+                            lerp(tangents.z,tangents.w,uv.y));
+          }
+          // Recover positive metric distance of a stationary feature from A/B rays.
+          // The least-squares miss distance detects pixels not on a common epipolar
+          // surface (e.g. moving props, TAA ghosting, reflected scenery).
+          struct XrfgDepthEstimate {float distance;float confidence;};
+          XrfgDepthEstimate xrfg_recon_depth(float2 pB,float2 pA,uint eye) {
+              XrfgDepthEstimate bad;bad.distance=0.0;bad.confidence=0.0;
+              CameraMapping m=PreviousMappings[eye];
+              float3 baseline=xrfg_recon_baseline(eye);
+              float baseline2=dot(baseline,baseline);
+              if (baseline2<0.000004 || baseline2>0.0625) return bad;
+              float2 bxy=xrfg_recon_tangent(pB,m.TargetRect,m.TargetTangents);
+              float2 axy=xrfg_recon_tangent(pA,m.SourceRect,m.SourceTangents);
+              float3 rb=float3(bxy,-1.0);
+              float4 ainb=float4(-m.TargetToSourceRotation.xyz,
+                                    m.TargetToSourceRotation.w);
+              float3 ra=rotate_by_quaternion(ainb,float3(axy,-1.0));
+              float aa=dot(ra,ra), bb=dot(ra,rb), cc=dot(rb,rb);
+              float dd=dot(ra,baseline), ee=dot(rb,baseline);
+              float denom=aa*cc-bb*bb;
+              if (denom<0.00000001) return bad;
+              float tb=(bb*dd-aa*ee)/denom;
+              float ta=(dd+bb*tb)/aa;
+              if (tb<0.25 || tb>150.0 || ta<0.25 || ta>155.0) return bad;
+              float miss=length(ta*ra-tb*rb-baseline);
+              // Scale tolerance with distance to avoid rejecting a long-range ray
+              // because of a subpixel optical-flow rounding error.
+              float tolerance=0.008+0.0015*tb;
+              bad.distance=tb;
+              bad.confidence=saturate(1.0-miss/max(tolerance,0.008));
+              return bad;
+          }
+          float xrfg_recon_rgb_error(float3 a,float3 b) {
+              float3 d=abs(a-b);
+              return max(d.x,max(d.y,d.z));
+          }
+          // Fit thin features locally at FULL output resolution, not at the coarse
+          // 25% optical-flow grid. Color and epipolar geometry must agree; an
+          // occlusion/moving object cannot be forced into a spurious depth solution.
+          float2 xrfg_recon_refine_flow(float2 pixel,float2 raw,uint slice,uint eye,
+                                        float4 current_color) {
+              if (!xrfg_recon_enabled() || repeated_capture_flag()!=0u) return raw;
+              const float3 baseline=xrfg_recon_baseline(eye);
+              if (dot(baseline,baseline)<0.000004) return raw;
+              float2 pA=pixel+raw;
+              CameraMapping m=PreviousMappings[eye];
+              float2 minP=m.SourceRect.xy;
+              float2 maxP=minP+m.SourceRect.zw-1.0;
+              if (any(pA<minP) || any(pA>maxP)) return raw;
+              float3 b=current_color.rgb;
+              float3 l=bilinear_current_source(pixel+float2(-1.0,0.0),slice).rgb;
+              float3 r=bilinear_current_source(pixel+float2( 1.0,0.0),slice).rgb;
+              float3 u=bilinear_current_source(pixel+float2(0.0,-1.0),slice).rgb;
+              float3 d=bilinear_current_source(pixel+float2(0.0, 1.0),slice).rgb;
+              float2 grad=float2(dot(r-l,float3(0.2126,0.7152,0.0722)),
+                                 dot(d-u,float3(0.2126,0.7152,0.0722)));
+              float edge=length(grad);
+              if (edge<0.045) return raw; // Interiors retain stock's flow.
+              float2 normal=grad/max(edge,0.0001);
+              float mismatch=xrfg_recon_rgb_error(
+                  bilinear_previous_source(pA,slice).rgb,b);
+              if (mismatch<0.06) return raw; // No correction needed.
+              XrfgDepthEstimate initial=xrfg_recon_depth(pixel,pA,eye);
+              float best_score=mismatch+0.004*(1.0-initial.confidence);
+              float2 best=raw;
+              // Four full-resolution pixel-level candidates, edge-normal only.
+              // Unrolled, with geometric validation and a penalty for overshooting.
+              [unroll] for (uint i=0u;i<4u;++i) {
+                  float offset=i==0u?-2.0:i==1u?-1.0:i==2u?1.0:2.0;
+                  float2 candidate=pA+normal*offset;
+                  if (any(candidate<minP) || any(candidate>maxP)) continue;
+                  float err=xrfg_recon_rgb_error(
+                      bilinear_previous_source(candidate,slice).rgb,b);
+                  XrfgDepthEstimate depth=xrfg_recon_depth(pixel,candidate,eye);
+                  // Under strong parallax, preserve surfaces with a plausible depth.
+                  float penalty=depth.confidence>0.25 ? 0.0 : 0.035;
+                  float score=err+abs(offset)*0.006+penalty;
+                  if (score<best_score) {best_score=score;best=candidate-pixel;}
+              }
+              // A strong correspondence is required before moving a cockpit edge.
+              return best_score < mismatch*0.8 && best_score<0.18 ? best : raw;
+          }
+          
+          '''
+          SHADER_FLOW='''                    raw_backward = repeated_capture_flag() != 0
+                                  ? float2(0.0, 0.0)
+                                  : flow_for_pixel(
+                                      pixel,
+                                      Slice,
+                                      ViewIndex,
+                                      flow_value_scale,
+                                      use_nvidia_cost);
+                              float2 residual_backward = input_pose_compensated'''
+          SHADER_FLOW_NEW='''                    raw_backward = repeated_capture_flag() != 0
+                                  ? float2(0.0, 0.0)
+                                  : flow_for_pixel(
+                                      pixel,
+                                      Slice,
+                                      ViewIndex,
+                                      flow_value_scale,
+                                      use_nvidia_cost);
+                              // FidelityFX-only: full-resolution geometry-constrained
+                              // edge matching before the standard midpoint solve.
+                              if (!use_nvidia_cost && !input_pose_compensated &&
+                                  !use_game_motion_pipeline && xrfg_recon_enabled()) {
+                                  raw_backward=xrfg_recon_refine_flow(
+                                      pixel,raw_backward,Slice,ViewIndex,current_fallback.color);
+                              }
+                              float2 residual_backward = input_pose_compensated'''
+          # In the normal FidelityFX confidence branch, occlusion protection chooses
+          # a single trusted surface instead of ghost blending two unrelated ones.
+          SHADER_COLOR='''                        output_color = saturate(lerp(
+                                      stable_midpoint,
+                                      flow_midpoint,
+                                      confidence));
+          #ifdef XRFG_HYBRID
+                                  last_disagreement = lerp(stable_disagreement, compared, confidence);
+          #endif
+                              }
+                              }'''
+          SHADER_COLOR_NEW='''                        output_color = saturate(lerp(
+                                      stable_midpoint,
+                                      flow_midpoint,
+                                      confidence));
+                                  // At a disagreeing high-contrast boundary the
+                                  // averaged output is a transparent double edge.
+                                  // Use the current sample where prior content has
+                                  // no verified parallax/correspondence; the remaining
+                                  // scene is identical to upstream V577.
+                                  if (xrfg_recon_enabled() && !use_nvidia_cost &&
+                                      disagreement>0.18 && repeated_capture_flag()==0u &&
+                                      current_sample.valid>=0.5 &&
+                                      previous_sample.valid>=0.5) {
+                                      float2 source_at=pixel+raw_backward;
+                                      XrfgDepthEstimate surface=xrfg_recon_depth(
+                                          pixel,source_at,ViewIndex);
+                                      if (surface.confidence<0.2) {
+                                          // Don't paint two incompatible surfaces.
+                                          output_color=saturate(current_sample.color);
+                                      }
+                                  }
+          #ifdef XRFG_HYBRID
+                                  last_disagreement = lerp(stable_disagreement, compared, confidence);
+          #endif
+                              }
+                              }'''
+          
+          
+          def patch(root:Path,mode:str)->None:
+              paths={k:root/v for k,v in [('app',APP),('synth',SYNTH),('shader',SHADER)]}
+              src={k:p.read_text(encoding='utf-8').replace('\r\n','\n') for k,p in paths.items()}
+              for v,key in [(APP_FUNC,'app'),(APP_ANCHOR,'app'),(SHADER_ENTRY,'shader'),
+                            (SHADER_FLOW,'shader'),(SHADER_COLOR,'shader'),
+                            (SYNTH_ANCHOR,'synth'),(SYNTH_MASK,'synth')]:
+                  if src[key].count(v)!=1:
+                      raise RuntimeError(f'FAIL CLOSED: {key} anchor occurs {src[key].count(v)} times: {v[:45]}')
+              if mode=='stock':
+                  print('Validated unmodified pinned V577 anchors. STOCK remains untouched.')
+                  return
+              app=src['app'];synth=src['synth'];shader=src['shader']
+              app=once(app,APP_FUNC,GATE+APP_FUNC_NEW,'app function+gate')
+              app=once(app,APP_ANCHOR,APP_NEW,'app view position')
+              app=once(app,'''            &first_generated);
+                  const bool current_built = build_generated_frame_end_info(''',
+                '''            &first_generated, &*previous_snapshot, interpolation_fraction);
+                  const bool current_built = build_generated_frame_end_info(''','first synthetic fraction')
+              app=once(app,'''                    &extra_generated[extra])) {''',
+                '''                    &extra_generated[extra], &*previous_snapshot,
+                              extra_fractions[extra])) {''','extra synthetic fraction')
+              synth=once(synth,SYNTH_ANCHOR,GATE+SYNTH_SUPPORT+SYNTH_ANCHOR,'synth helper')
+              synth=once(synth,SYNTH_MASK,SYNTH_MASK_NEW,'FFX specific packed baseline')
+              shader=once(shader,SHADER_ENTRY,SHADER_HELPERS+SHADER_ENTRY,'shader geometric helpers')
+              shader=once(shader,SHADER_FLOW,SHADER_FLOW_NEW,'shader flow refinement')
+              shader=once(shader,SHADER_COLOR,SHADER_COLOR_NEW,'shader occlusion gate')
+              for k,s in [('app',app),('synth',synth),('shader',shader)]:
+                  if s==src[k]:raise RuntimeError('No diff for '+k)
+                  paths[k].write_text(s,encoding='utf-8',newline='\n')
+              for k,v in [('app','994'),('synth','995'),('synth','(1U<<30U)'),('shader','(1u<<30u)')]:
+                  assert v in {'app':app,'synth':synth,'shader':shader}[k]
+              print(f'Applied V577 AMD parallax/edge reconstruction to {mode} (MSFS-only)')
+          
+          if __name__=='__main__':
+              cli=argparse.ArgumentParser()
+              cli.add_argument('--root',type=Path,required=True)
+              cli.add_argument('--mode',choices=['stock','reconstructed'],required=True)
+              a=cli.parse_args()
+              patch(a.root,a.mode)
+          '@ | Set-Content -Encoding utf8 apply_reconstruction.py
+          @'
+          #!/usr/bin/env python3
+          """Deterministic geometry, 3X timing, source contract, C++ compile probes.
+          Requires stdlib; compiles standalone math helper if clang++ is available.
+          """
+          from __future__ import annotations
+          from dataclasses import dataclass
+          import math, os, random, shutil, subprocess, tempfile
+          from pathlib import Path
+          import apply_reconstruction as recon
+          
+          @dataclass
+          class V:
+              x:float;y:float;z:float
+              def __add__(self,b):return V(self.x+b.x,self.y+b.y,self.z+b.z)
+              def __sub__(self,b):return V(self.x-b.x,self.y-b.y,self.z-b.z)
+              def __mul__(self,a):return V(self.x*a,self.y*a,self.z*a)
+              def dot(self,b):return self.x*b.x+self.y*b.y+self.z*b.z
+              def size(self):return math.sqrt(self.dot(self))
+          
+          def infer(A,B,ray_A,ray_B):
+              baseline=B-A
+              a=ray_A.dot(ray_A);b=ray_A.dot(ray_B);c=ray_B.dot(ray_B)
+              d=ray_A.dot(baseline);e=ray_B.dot(baseline)
+              den=a*c-b*b
+              if den<1e-8:return None
+              tB=(b*d-a*e)/den
+              tA=(d+b*tB)/a
+              return tA,tB,(ray_A*tA-ray_B*tB-baseline).size()
+          
+          def run():
+              rng=random.Random(577)
+              good=0
+              # Known 3D world point, two displaced cameras, including near cockpit.
+              for k in range(12000):
+                  A=V(0,0,0)
+                  B=V(rng.uniform(-.03,.03),rng.uniform(-.03,.03),rng.uniform(-.03,.03))
+                  P=V(rng.uniform(-.45,.45),rng.uniform(-.45,.45),-rng.uniform(.28,3.0))
+                  if B.size()<.006:continue
+                  pa=P-A;pb=P-B
+                  ta,tb,miss=infer(A,B,pa,pb)
+                  assert abs(ta-1)<2e-4,(k,ta)
+                  assert abs(tb-1)<2e-4,(k,tb)
+                  assert miss<2e-6,(k,miss)
+                  # The pixel geometry P is inferred by tb*pb from B camera.
+                  reconstructed=B+pb*tb
+                  assert (reconstructed-P).size()<1e-4
+                  # Frame-accurate synthetic positional camera: A->B at 1/3, 2/3.
+                  for f in (1/3,2/3):
+                      mid=A+(B-A)*f
+                      ray_mid=P-mid
+                      assert ((mid+ray_mid)-P).size()<1e-12
+                  good+=1
+              assert good>9500
+              # Sign regression: A=0, B right of A, foreground point projects left.
+              A=V(0,0,0);B=V(.015,0,0);P=V(0,0,-.5)
+              ta,tb,miss=infer(A,B,P-A,P-B)
+              assert abs(tb-1)<1e-9 and miss<1e-9
+              # Fail closed: exact expected source anchors, skip untouched stock test.
+              assert 'GameMotionJitterDelta.y>0.5' in recon.SHADER_HELPERS
+              assert 'view.pose.position=' in recon.APP_NEW
+              assert recon.SHADER_HELPERS.count('XrfgDepthEstimate')>2
+              assert recon.SYNTH_MASK_NEW.count('parameters.synthesis_flags|=(1U<<30U)')==1
+              # Verify code templates really close and do not create unsafe OpenXR chains.
+              assert 'view.next =' not in recon.APP_NEW
+              assert 'source->displayTime' not in recon.APP_NEW
+              # Syntax-only independent C++ probe for the *actual* emitted camera helper.
+              compiler=shutil.which('clang++') or shutil.which('g++')
+              if compiler:
+                  stub='''#include <array>\n#include <cmath>\n#include <cstdint>\nstruct Quaternion{float x,y,z,w;};
+          struct Vec3{float x,y,z;};
+          struct Pose{Quaternion orientation;Vec3 position;};
+          struct D3D12ReprojectionView{Pose pose;};
+          Quaternion normalize(Quaternion q){float n=std::sqrt(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w);return {q.x/n,q.y/n,q.z/n,q.w/n};}
+          Quaternion multiply(Quaternion a,Quaternion b){return {a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w,a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z};}
+          ''' + recon.SYNTH_SUPPORT + '''\nint main(){D3D12ReprojectionView a{},b{};a.pose.orientation.w=b.pose.orientation.w=1;b.pose.position.x=.015f;
+           auto t=xrfg_recon_camera_baseline(a,b);return std::abs(t[0]-.015f)>0.000001f;}\n'''
+                  with tempfile.TemporaryDirectory() as t:
+                      code=Path(t)/'math.cpp'; exe=Path(t)/('math.exe' if os.name=='nt' else 'math');code.write_text(stub)
+                      subprocess.run([compiler,'-std=c++20','-Wall','-Wextra','-Werror',str(code),'-o',str(exe)],check=True)
+                      subprocess.run([str(exe)],check=True)
+              print(f'PASS {good} 3D parallax/pose cases, edge/occlusion contract, C++ helper probe')
+          
+          if __name__=='__main__':run()
+          '@ | Set-Content -Encoding utf8 test_reconstruction.py
+          python -m py_compile apply_reconstruction.py test_reconstruction.py
+          if ($LASTEXITCODE -ne 0) { throw 'Patcher compile failed' }
+          python test_reconstruction.py
+          if ($LASTEXITCODE -ne 0) { throw 'Reconstruction geometry tests failed' }
+
+      - name: Cache the FidelityFX SDK libraries
+        id: ffx-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.FFX_ROOT }}/sdk/include
+            ${{ env.FFX_ROOT }}/sdk/bin/ffx_sdk
+          key: ffx-${{ env.FFX_COMMIT }}-of-dx12-static-vs2022-x64-v1
+
+      - name: Build FidelityFX SDK 1.1.4 when not cached
+        if: steps.ffx-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --branch $env:FFX_TAG --depth 1 `
+            https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git $env:FFX_ROOT
+          $head = (git -C $env:FFX_ROOT rev-parse HEAD).Trim()
+          if ($head -ne $env:FFX_COMMIT) { throw "FidelityFX tag moved: $head" }
+          cmake -S "$env:FFX_ROOT/sdk" -B build-fidelityfx -G "Visual Studio 17 2022" -A x64 `
+            -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX configure failed' }
+          cmake --build build-fidelityfx --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX build failed' }
+          foreach ($lib in 'ffx_backend_dx12_x64.lib', 'ffx_opticalflow_x64.lib') {
+            if (-not (Test-Path "$env:FFX_ROOT/sdk/bin/ffx_sdk/$lib")) { throw "Missing $lib" }
+          }
+
+      - name: Fetch pinned NVIDIA DLSS headers
+        shell: pwsh
+        env:
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git -c advice.detachedHead=false clone --branch $env:DLSS_TAG --depth 1 `
+            --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
+          if ($LASTEXITCODE -ne 0) { throw 'DLSS clone failed' }
+          git -C external/DLSS sparse-checkout set include
+          $head = (git -C external/DLSS rev-parse HEAD).Trim()
+          if ($head -ne $env:DLSS_COMMIT) { throw "DLSS tag moved: $head" }
+          if (-not (Test-Path external/DLSS/include/nvsdk_ngx_params.h)) { throw 'Missing NGX headers' }
+
+      - name: Fetch pinned OpenVR header
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force external/openvr | Out-Null
+          curl.exe -fsSL -o external/openvr/openvr.h `
+            "https://raw.githubusercontent.com/ValveSoftware/openvr/$env:OPENVR_TAG/headers/openvr.h"
+          if ($LASTEXITCODE -ne 0) { throw 'OpenVR header download failed' }
+          $hash = (Get-FileHash external/openvr/openvr.h -Algorithm SHA256).Hash
+          if ($hash -ne $env:OPENVR_SHA256) { throw "OpenVR checksum mismatch: $hash" }
+
+      - name: Find original Microsoft fxc shader compiler
+        id: fxc
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\fxc.exe' -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'No fxc.exe found in Windows SDK' }
+          "path=$($fxc.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Using: $($fxc.FullName)"
+
+      - name: Compile both complete release variants and run all CI-compatible CTests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'dist/OFXR-V577-MotionReconstruction'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $modes = @('01-stock', '02-reconstructed')
+          $hashes = @{}
+          foreach ($mode in $modes) {
+            git checkout -- src/layer/openxr_layer.cpp src/d3d12/frame_synthesis.hlsl src/d3d12/d3d12_frame_synthesizer.cpp
+            if ($LASTEXITCODE -ne 0) { throw 'Source restore failed' }
+            $setting = if ($mode -eq '01-stock') { 'stock' } else { 'reconstructed' }
+            python apply_reconstruction.py --root . --mode $setting
+            if ($LASTEXITCODE -ne 0) { throw "Patcher refused $mode" }
+            git diff --check
+            if ($LASTEXITCODE -ne 0) { throw "Source diff verification failed: $mode" }
+            $dir = "$root/$mode"
+            New-Item -ItemType Directory -Force "$dir/ofxr", "$dir/licenses", `
+              "$dir/external/OpenXR-SDK/LICENSES", "$dir/external/Vulkan-Headers" | Out-Null
+            git diff --binary -- src/layer/openxr_layer.cpp src/d3d12/d3d12_frame_synthesizer.cpp src/d3d12/frame_synthesis.hlsl |
+              Out-File -Encoding utf8 "$dir/SOURCE_CHANGE.patch"
+            $build = "build-pose-$mode"
+            cmake -S . -B $build -G 'Visual Studio 17 2022' -A x64 `
+                -DXRFG_FXC_EXECUTABLE="${{ steps.fxc.outputs.path }}"
+            if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $mode" }
+            cmake --build $build --config Release --parallel
+            if ($LASTEXITCODE -ne 0) { throw "MSVC or fxc compilation failed: $mode" }
+            & ctest --test-dir $build -C Release --output-on-failure `
+                --timeout 300 -LE needs_gpu_timing | Tee-Object -FilePath "$dir/TESTS.txt"
+            if ($LASTEXITCODE -ne 0) { throw "CTest regression: $mode" }
+            Copy-Item "$build/Release/OFXRBridgeTray.exe" $dir
+            Copy-Item "$build/Release/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll", `
+              "$build/Release/ofxr/OFXR_vulkan_queue_layer.dll", `
+              "$build/Release/ofxr/ofxr_bridge.ini" "$dir/ofxr"
+            Copy-Item README.md, LICENSE, THIRD_PARTY.md $dir
+            Copy-Item licenses/* "$dir/licenses"
+            Copy-Item external/OpenXR-SDK/LICENSES/* "$dir/external/OpenXR-SDK/LICENSES"
+            Copy-Item external/Vulkan-Headers/LICENSE.md "$dir/external/Vulkan-Headers"
+            @"
+          MODE=$mode
+          UPSTREAM=$env:UPSTREAM_COMMIT
+          STOCK untouched or experimental MSFS-only position-space/FFX parallax reconstruction.
+          TAA + FidelityFX, 3X 72Hz, VDXR, SSW off.
+          MSFS-only: interpolated synthetic position, B orientation/FOV,
+          FidelityFX 3D parallax inference and edge-local refinement.
+          No runtime-provided depth; estimated scene depth is confidence-gated.
+          Keep the stock rollback.
+          "@ | Set-Content -Encoding utf8 "$dir/VARIANT.txt"
+            $dll = "$dir/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll"
+            $hashes[$mode] = (Get-FileHash $dll -Algorithm SHA256).Hash
+            "$mode DLL_SHA256=$($hashes[$mode])" | Set-Content -Encoding ascii "$dir/BUILD_SHA256.txt"
+            Remove-Item -Recurse -Force $build
+          }
+          if (@($hashes.Values | Sort-Object -Unique).Count -ne 2) {
+            throw 'Variant DLL SHA256 hashes are equal; patch may not have built'
+          }
+          Copy-Item apply_reconstruction.py "$root/PATCHER_SOURCE.py"
+          Copy-Item test_reconstruction.py "$root/PARALLAX_GEOMETRY_TESTS.py"
+          $env:UPSTREAM_COMMIT | Set-Content -Encoding ascii "$root/UPSTREAM_COMMIT.txt"
+
+      - name: Audit compiled EXEs and DLLs with Microsoft Defender
+        shell: pwsh
+        run: |
+          # This step DOES NOT assert that an unsigned binary is safe.
+          # Fail closed if on-runner anti-malware scanning is unavailable.
+          $ErrorActionPreference = 'Stop'
+          $auditRoot = 'dist/security-audit'
+          New-Item -ItemType Directory -Force $auditRoot | Out-Null
+          $report = Join-Path $auditRoot 'SecurityAudit.txt'
+          $lines = [System.Collections.Generic.List[string]]::new()
+          function Record([string] $message) {
+            $lines.Add($message)
+            Write-Host $message
+            $lines | Set-Content -Path $report -Encoding utf8
+          }
+          Record ('OFXR V577 reconstructed Windows binary security audit; UTC: ' + (Get-Date).ToUniversalTime().ToString('o'))
+          Record ('Workflow: ' + $env:GITHUB_WORKFLOW)
+          Record ('Runner: ' + $env:RUNNER_OS)
+          Record ('Commit: ' + $env:UPSTREAM_COMMIT)
+          $root = (Resolve-Path 'dist/OFXR-V577-MotionReconstruction').Path
+          $binaries = @(Get-ChildItem $root -Recurse -File | Where-Object {
+            $_.Extension -in @('.exe', '.dll')
+          } | Sort-Object FullName)
+          Record ('Binary count: ' + $binaries.Count)
+          if ($binaries.Count -ne 6) { throw 'Expected two EXEs and four DLLs' }
+          foreach ($binary in $binaries) {
+            $rel = $binary.FullName.Substring($root.Length + 1).Replace('\','/')
+            Record ('BIN SHA256=' + (Get-FileHash $binary.FullName -Algorithm SHA256).Hash + '  ' + $rel)
+          }
+          if (-not (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) -or
+              -not (Get-Command Start-MpScan -ErrorAction SilentlyContinue) -or
+              -not (Get-Command Get-MpThreatDetection -ErrorAction SilentlyContinue)) {
+            Record 'INDETERMINATE: Microsoft Defender scanning cmdlets are unavailable on this runner'
+            throw 'Security audit unavailable. Binary artifact not uploaded.'
+          }
+          try {
+            $status = Get-MpComputerStatus -ErrorAction Stop
+            Record ('Defender AMServiceEnabled=' + $status.AMServiceEnabled +
+              ' AntivirusEnabled=' + $status.AntivirusEnabled +
+              ' SignatureLastUpdated=' + $status.AntivirusSignatureLastUpdated)
+            if (-not $status.AMServiceEnabled -or -not $status.AntivirusEnabled) {
+              Record 'INDETERMINATE: Microsoft Defender Antivirus is disabled on this runner'
+              throw 'Security audit unavailable. Binary artifact not uploaded.'
+            }
+            if ($null -eq $status.AntivirusSignatureLastUpdated -or
+                $status.AntivirusSignatureLastUpdated -lt (Get-Date).AddDays(-14)) {
+              Record 'INDETERMINATE: Antivirus signatures are older than 14 days'
+              throw 'Defender signatures too old to permit artifact upload.'
+            }
+            $auditStart = (Get-Date).AddMinutes(-30)
+            foreach ($binary in $binaries) {
+              Record ('Scanning ' + $binary.FullName)
+              Start-MpScan -ScanType CustomScan -ScanPath $binary.FullName -ErrorAction Stop
+              if (-not (Test-Path -LiteralPath $binary.FullName)) {
+                Record ('DETECTION OR QUARANTINE: binary disappeared after scanning: ' + $binary.Name)
+                throw 'Security scan removed a file. Binary artifact not uploaded.'
+              }
+            }
+            $detections = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object {
+              $_.InitialDetectionTime -ge $auditStart
+            })
+            foreach ($detection in $detections) {
+              Record ('DETECTION: ThreatID=' + $detection.ThreatID +
+                ' Time=' + $detection.InitialDetectionTime +
+                ' Resources=' + ($detection.Resources -join ';'))
+            }
+            if ($detections.Count -gt 0) {
+              throw 'Defender reported detections. Binary artifact not uploaded.'
+            }
+            Record 'SCAN RESULT: no recent detections returned by Microsoft Defender on this runner.'
+            Record 'LIMITATION: a clean scan is NOT proof of safety; browser warning may remain.'
+          } catch {
+            Record ('AUDIT FAILED: ' + $_.Exception.Message)
+            throw
+          }
+
+      - name: Upload source-only security audit report (no binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-V577-SECURITY-AUDIT-TEXT-ONLY
+          path: dist/security-audit/SecurityAudit.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload stock and reconstructed variants only after Defender audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-V577-MotionReconstruction-UNSIGNED
+          path: dist/OFXR-V577-MotionReconstruction/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostic logs if build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-MotionReconstruction-failed-build-logs
+          path: |
+            build-pose-*/Testing/Temporary/LastTest.log
+            build-pose-*/Testing/Temporary/*.log
+            build-pose-*/CMakeFiles/CMakeConfigureLog.yaml
+            dist/OFXR-V577-MotionReconstruction/*/SOURCE_CHANGE.patch
+            dist/OFXR-V577-MotionReconstruction/*/TESTS.txt
+          if-no-files-found: ignore
