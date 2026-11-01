@@ -45,8 +45,8 @@ jobs:
           
           Modes:
             stock: no source change
-            presenter-only: make every frame a PRIME copy, no synthetic pair.
-            direct-current: synthesize synthetic RT from B/current image with no optical-flow result.
+            presenter-only: only in MSFS2024, make each frame a PRIME copy.
+            direct-current: only in MSFS2024, select B/current pixels in the synthetic shader.
           
           This tool intentionally does not copy arbitrary OpenXR next chains into synthetic
           frames; some contain swapchain-specific depth attachments. It adds sampled
@@ -58,16 +58,22 @@ jobs:
           
           APP_REL = Path('src/layer/openxr_layer.cpp')
           SHADER_REL = Path('src/d3d12/frame_synthesis.hlsl')
+          SYNTH_REL = Path('src/d3d12/d3d12_frame_synthesizer.cpp')
           PAIR_ANCHOR_ONE = 'const bool metadata_pairable =\n        latest_application_frame && previous_snapshot && snapshots_compatible;'
           SHADER_ANCHOR = '''float4 SynthesizeMidpointPS(FullscreenVertex input) : SV_Target {
               return synthesize_midpoint(input, 1.0, false, false, false, false, false);
           }'''
-          SHADER_REPLACEMENT = '''// DIAGNOSTIC: intentionally feed the real B image through the synthetic
+          SHADER_REPLACEMENT = '''// DIAGNOSTIC: selectively feed the real B image through the synthetic
           // render target and the normal V577 synthetic submit path. No optical-flow
           // movement in the resulting pixels. The GPU flow pass may still run; this
           // isolates the presented image, not the compute cost of the whole pipeline.
           float4 SynthesizeMidpointPS(FullscreenVertex input) : SV_Target {
-              return CurrentFrame.Load(int4(int2(input.position.xy), int(Slice), 0));
+              // Bit 30 is an MSFS-only diagnostic switch set by the CPU synthesizer.
+              // In every other executable, exercise the unmodified V577 shader.
+              [branch] if ((SynthesisFlags & (1u << 30u)) != 0u) {
+                  return CurrentFrame.Load(int4(int2(input.position.xy), int(Slice), 0));
+              }
+              return synthesize_midpoint(input, 1.0, false, false, false, false, false);
           }'''
           
           # Capture metadata BEFORE the existing V577 synthetic next-chain removal.
@@ -98,11 +104,32 @@ jobs:
                       }
                       if (synthetic) {
                           // The V008 shader generates the synthetic image in B's camera'''
+          APP_PROCESS_ANCHOR = '[[nodiscard]] bool build_generated_frame_end_info(' 
+          DIAG_PROCESS_HELPER = '''// Experiment isolated to the real simulator process. CTest mock applications
+          // must retain V577 pairing, GPU outputs, presentation and lifetime semantics.
+          // Checking the loaded process name also keeps these diagnostic DLLs harmless
+          // to other OpenXR applications if the API layer is registered globally.
+          [[nodiscard]] bool xrfg_diag_is_msfs_process() noexcept {
+              static const bool active = []() noexcept {
+                  wchar_t module[MAX_PATH]{};
+                  const DWORD size = GetModuleFileNameW(nullptr, module, MAX_PATH);
+                  if (size == 0 || size >= MAX_PATH) return false;
+                  const wchar_t* base = module;
+                  for (DWORD i = 0; i < size; ++i) {
+                      if (module[i] == L'\\' || module[i] == L'/') base = module + i + 1;
+                  }
+                  return CompareStringOrdinal(base, -1, L"FlightSimulator2024.exe", -1, TRUE)
+                      == CSTR_EQUAL;
+              }();
+              return active;
+          }
+          
+          '''
           META_START = '''    output->info = *source;
               output->layer_pointers.assign('''
           META_START_REPLACEMENT = '''    // Limit per-frame telemetry to avoid perturbing frame timing.
               static std::atomic<std::uint64_t> diagnostic_metadata_counter{0};
-              const bool diagnostic_metadata_sample =
+              const bool diagnostic_metadata_sample = xrfg_diag_is_msfs_process() &&
                   diagnostic_metadata_counter.fetch_add(1, std::memory_order_relaxed) % 90 == 0;
               if (diagnostic_metadata_sample) {
                   // Diagnostic 990: variant ID 1=PRIME-only, 2=B-image synthetic.
@@ -137,10 +164,24 @@ jobs:
                   for (XrCompositionLayerProjectionView& view : projection.views) {
                       view.next = nullptr;
                   }'''
+          SYNTH_FUNC_ANCHOR = '[[nodiscard]] constexpr UINT packed_synthesis_fraction(float fraction) noexcept {'
+          SYNTH_PARAM_ANCHOR = '''        slot.command_list->SetPipelineState(pack_pipeline.Get());
+          
+                  SynthesisParameters parameters{};
+                  parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |
+                      pack_input_flags(view_format) | (flat_panel ? kFlatPanelFlag : 0U);'''
+          SYNTH_PARAM_REPLACEMENT = '''        slot.command_list->SetPipelineState(pack_pipeline.Get());
+          
+                  SynthesisParameters parameters{};
+                  // Diagnostic bit 30 survives every synthetic-output flags recomposition.
+                  // Keep this OFF for CTest and for all processes except MSFS 2024.
+                  parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |
+                      pack_input_flags(view_format) | (flat_panel ? kFlatPanelFlag : 0U) |
+                      (xrfg_diag_is_msfs_process() ? (1U << 30U) : 0U);'''
           OWNER_COUNTER_ANCHOR = '''    auto output = std::make_shared<GeneratedFrameEndInfo>(std::move(source));
               std::vector<bool> projection_indices'''
           OWNER_COUNTER_REPLACEMENT = '''    static std::atomic<std::uint64_t> diagnostic_owner_counter{0};
-              const bool diagnostic_owner_sample =
+              const bool diagnostic_owner_sample = xrfg_diag_is_msfs_process() &&
                   diagnostic_owner_counter.fetch_add(1, std::memory_order_relaxed) % 90 == 0;
               auto output = std::make_shared<GeneratedFrameEndInfo>(std::move(source));
               std::vector<bool> projection_indices'''
@@ -168,9 +209,11 @@ jobs:
               root = args.root.resolve()
               app = root / APP_REL
               shader = root / SHADER_REL
+              synth = root / SYNTH_REL
               # Check exact V577 anchors even if compiling an unmodified control.
               a = app.read_text(encoding='utf-8').replace('\r\n', '\n')
               h = shader.read_text(encoding='utf-8').replace('\r\n', '\n')
+              d = synth.read_text(encoding='utf-8').replace('\r\n', '\n')
               for label, content, anchor in (
                   ('application pair condition', a, PAIR_ANCHOR_ONE),
                   ('FidelityFX pixel entrypoint', h, SHADER_ANCHOR),
@@ -178,6 +221,9 @@ jobs:
                   ('projection info allocation', a, META_START),
                   ('ownership projection chain', a, OWN_ANCHOR),
                   ('ownership sample insertion', a, OWNER_COUNTER_ANCHOR),
+                  ('process gate insertion', a, APP_PROCESS_ANCHOR),
+                  ('D3D12 helper anchor', d, SYNTH_FUNC_ANCHOR),
+                  ('D3D12 FidelityFX flags anchor', d, SYNTH_PARAM_ANCHOR),
               ):
                   if content.count(anchor) != 1:
                       raise SystemExit(f'FAIL CLOSED: pinned V577 {label} not found exactly once')
@@ -186,6 +232,7 @@ jobs:
                   return
           
               def patch_app(content: str) -> str:
+                  content = replace_once(content, APP_PROCESS_ANCHOR, DIAG_PROCESS_HELPER + APP_PROCESS_ANCHOR, 'MSFS-only process gate')
                   content = replace_once(content, OWNER_COUNTER_ANCHOR, OWNER_COUNTER_REPLACEMENT, 'owner sampling start')
                   content = replace_once(content, OWN_ANCHOR, OWN_REPLACE, 'owner chains trace')
                   content = replace_once(content, META_START,
@@ -198,16 +245,25 @@ jobs:
                       # Presenter repeats its last owned real image in empty slots;
                       # no generated image / optical-flow composition is submitted.
                       content = replace_once(content, PAIR_ANCHOR_ONE,
-                          '''// DIAGNOSTIC: always produce PRIME/current copies. The normal
-              // presenter repeats the last owned real frame for the other 3X slots.
-              const bool metadata_pairable = false;''', 'presenter-only prime mode')
+            '''// DIAGNOSTIC: force PRIME/current copies only in FlightSimulator2024.exe.
+              // All upstream CTest/mock processes preserve original V577 frame pairing.
+              const bool metadata_pairable =
+                  latest_application_frame && previous_snapshot && snapshots_compatible &&
+                  !xrfg_diag_is_msfs_process();''', 'presenter-only prime mode')
                   return content
           
               edit(app, patch_app)
               if args.mode == 'direct-current':
+                  def patch_synth(content: str) -> str:
+                      content = replace_once(content, SYNTH_FUNC_ANCHOR,
+                          DIAG_PROCESS_HELPER + SYNTH_FUNC_ANCHOR, 'D3D12 MSFS-only process gate')
+                      return replace_once(content, SYNTH_PARAM_ANCHOR, SYNTH_PARAM_REPLACEMENT,
+                          'FidelityFX composition diagnostic bit 30')
+                  edit(synth, patch_synth)
                   edit(shader, lambda s: replace_once(s, SHADER_ANCHOR,
                                     SHADER_REPLACEMENT, 'synthetic direct B image'))
               print('Applied pinned V577 diagnostic:', args.mode)
+              print('NOTE: altered behavior is limited to FlightSimulator2024.exe. All CTest process behavior stays V577 stock.')
               print('NOTE: synthetic OpenXR view-next attachments remain stripped by V577 for safety.')
           
           if __name__ == '__main__':
@@ -286,7 +342,7 @@ jobs:
           $modes = @('01-stock', '02-presenter-only', '03-direct-current')
           $hashes = @{}
           foreach ($mode in $modes) {
-            git checkout -- src/layer/openxr_layer.cpp src/d3d12/frame_synthesis.hlsl
+            git checkout -- src/layer/openxr_layer.cpp src/d3d12/frame_synthesis.hlsl src/d3d12/d3d12_frame_synthesizer.cpp
             if ($LASTEXITCODE -ne 0) { throw 'Failed to restore exact upstream source' }
             $diagnostic = if ($mode -eq '01-stock') { 'stock' } elseif ($mode -eq '02-presenter-only') {
               'presenter-only'
@@ -298,7 +354,7 @@ jobs:
             $out = "$root/$mode"
             New-Item -ItemType Directory -Force "$out/ofxr", "$out/licenses", `
               "$out/external/OpenXR-SDK/LICENSES", "$out/external/Vulkan-Headers" | Out-Null
-            git diff --binary -- src/layer/openxr_layer.cpp src/d3d12/frame_synthesis.hlsl |
+            git diff --binary -- src/layer/openxr_layer.cpp src/d3d12/frame_synthesis.hlsl src/d3d12/d3d12_frame_synthesizer.cpp |
               Out-File -Encoding utf8 "$out/SOURCE_CHANGE.patch"
             $build = "build-diagnostic-$mode"
             cmake -S . -B $build -G 'Visual Studio 17 2022' -A x64 `
@@ -307,22 +363,12 @@ jobs:
             cmake --build $build --config Release --parallel
             if ($LASTEXITCODE -ne 0) { throw "Compilation failed: $mode" }
             $tests = "$out/TESTS.txt"
-            if ($mode -eq '03-direct-current') {
-              # Intentional non-reference synthetic pixels. Exclude upstream
-              # renderer/pixel/shader expectations; retain non-renderer tests.
-              $exclude = '(D3D12|d3d12|Pixel|pixel|Image|image|Synthesis|synthesis|Shader|shader|Render|render|GPU|gpu)'
-              & ctest --test-dir $build -C Release -N -E $exclude | Tee-Object -FilePath $tests
-              if ($LASTEXITCODE -ne 0) { throw "CTest discovery failed: $mode" }
-              & ctest --test-dir $build -C Release --output-on-failure `
-                  --timeout 300 -E $exclude -LE needs_gpu_timing | Tee-Object -Append -FilePath $tests
-              if ($LASTEXITCODE -ne 0) { throw "Non-renderer CTest regression: $mode" }
-              'Pixel-output regression tests excluded by design: pixel output deliberately differs from V577.' |
-                 Add-Content -Path $tests
-            } else {
-              & ctest --test-dir $build -C Release --output-on-failure `
-                  --timeout 300 -LE needs_gpu_timing | Tee-Object -FilePath $tests
-              if ($LASTEXITCODE -ne 0) { throw "CTest regression: $mode" }
-            }
+            # The experiment is only active inside the real FlightSimulator2024.exe.
+            # Test executables therefore use V577 stock semantics for ALL variants.
+            # Do NOT exclude broad categories of expected failures.
+            & ctest --test-dir $build -C Release --output-on-failure `
+                --timeout 300 -LE needs_gpu_timing | Tee-Object -FilePath $tests
+            if ($LASTEXITCODE -ne 0) { throw "FULL CTest regression: $mode" }
             Copy-Item "$build/Release/OFXRBridgeTray.exe" $out
             Copy-Item "$build/Release/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll", `
               "$build/Release/ofxr/OFXR_vulkan_queue_layer.dll", `
@@ -332,13 +378,13 @@ jobs:
             Copy-Item external/OpenXR-SDK/LICENSES/* "$out/external/OpenXR-SDK/LICENSES"
             Copy-Item external/Vulkan-Headers/LICENSE.md "$out/external/Vulkan-Headers"
             @"
-          Experimental OFXR V577 diagnostic -- UNSIGNED binary.
+          Experimental OFXR V577 MSFS-only diagnostic -- UNSIGNED binary.
           Exact upstream: $env:UPSTREAM_COMMIT
           MODE=$mode
           $(if ($mode -eq '01-stock') {'STOCK: no changes'} elseif ($mode -eq '02-presenter-only') {
-             'PRIME-only: real image copied into owned current swapchain; presenter repeats it in missing slots; no synthetic images.'
+             'MSFS-ONLY PRIME: real image copied into owned current swapchain; presenter repeats it in missing slots; no synthetic images.'
            } else {
-             'DIRECT CURRENT: current B-frame color drawn into synthetic swapchain with original B-frame pose/FOV, original metadata-chain restrictions.'
+             'MSFS-ONLY DIRECT CURRENT: current B-frame color drawn into synthetic swapchain with original B-frame pose/FOV, original metadata-chain restrictions.'
            })
           Compare at 3X 72Hz, MSFS TAA, VDXR, SSW OFF, Hybrid OFF, HUD fix OFF, FidelityFX 25%.
           Not production software. Keep a known-working official V577 backup.
@@ -356,6 +402,8 @@ jobs:
           @'
           ## Experiments
           01-stock: unmodified upstream V577.
+          All diagnostic effects are gated on executable FlightSimulator2024.exe.
+          The FULL upstream CTest suite must pass in each variant.
           02-presenter-only: force prime instead of pairing so only the real B
           image is copied into the owned current swapchain and submitted; the
           presenter repeats the last valid owned image in empty 72 Hz slots.
