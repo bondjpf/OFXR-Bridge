@@ -1,0 +1,561 @@
+name: OFXR V577 Pose-Aligned 3X (full regression + Defender)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_COMMIT: 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e
+  FFX_TAG: v1.1.4
+  FFX_COMMIT: c6efa6bf7f2027b3ec94f28578bb5965eabb9e55
+  FFX_ROOT: external/FidelityFX-SDK-v1.1.4
+  DLSS_TAG: v310.9.1
+  DLSS_COMMIT: 374959484e79a640feaba44c93ac8cfb0a03f5b5
+  OPENVR_TAG: v2.5.1
+  OPENVR_SHA256: 94E5545370159C85F87CD6E15DD3739F7C919FC7A6E869F5E4ED463533A07ED0
+
+jobs:
+  experimental-build:
+    name: Windows x64 build, test and package
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out exact upstream 0.2.14.3 (V577)
+        uses: actions/checkout@v4
+        with:
+          repository: djules75/OFXR-Bridge
+          ref: 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e
+          persist-credentials: false
+
+      - name: Verify upstream commit
+        shell: pwsh
+        run: |
+          $hash = (git rev-parse HEAD).Trim()
+          if ($hash -ne $env:UPSTREAM_COMMIT) { throw "Unexpected upstream commit: $hash" }
+          Write-Host "Pinned upstream: $hash"
+
+      - name: Install reviewed V577 pose-correction patcher and run math checks
+        shell: pwsh
+        run: |
+          @'
+          #!/usr/bin/env python3
+          """V577 pinned two-source, pose/pixel coupled correction. Stock is unchanged.
+          
+          The generated-color shader maps each synthetic pixel from its intermediate
+          orientation into the B camera before normal FidelityFX interpolation. The
+          synthetic XrCompositionLayerProjectionView supplies that same intermediate
+          orientation to OpenXR. Position remains B (no false 6DoF claim).
+          """
+          from __future__ import annotations
+          import argparse
+          from pathlib import Path
+          
+          PINNED = '0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e'
+          APP = 'src/layer/openxr_layer.cpp'
+          SYNTH = 'src/d3d12/d3d12_frame_synthesizer.cpp'
+          SHADER = 'src/d3d12/frame_synthesis.hlsl'
+          
+          def once(s, old, new, name):
+              n=s.count(old)
+              if n!=1: raise RuntimeError(f'FAIL CLOSED {name}: anchor count={n} expected 1')
+              return s.replace(old,new,1)
+          
+          PROCESS = r'''// Pose-aligned experiment: only the named MSFS executable receives the
+          // changed rendering. CTest executables and other OpenXR apps stay stock.
+          [[nodiscard]] bool xrfg_pose_is_msfs() noexcept {
+              static const bool enabled = []() noexcept {
+                  wchar_t path[MAX_PATH]{};
+                  const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+                  if (!n || n >= MAX_PATH) return false;
+                  const wchar_t* name = path;
+                  for (DWORD i = 0; i < n; ++i) {
+                      if (path[i] == 92 || path[i] == 47) name = path + i + 1;
+                  }
+                  return CompareStringOrdinal(name, -1, L"FlightSimulator2024.exe", -1, TRUE)
+                      == CSTR_EQUAL;
+              }();
+              return enabled;
+          }
+          
+          '''
+          
+          POSE_HELPERS = r'''// This is a ROTATIONAL re-projection only. Without reliable per-pixel
+          // scene depth the source B position must remain unchanged. Do not claim 6DoF.
+          [[nodiscard]] XrQuaternionf xrfg_pose_normalize(XrQuaternionf q) noexcept {
+              const float len2 = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+              if (!(len2 > 1.0e-12F) || !std::isfinite(len2)) return {0, 0, 0, 1};
+              const float s = 1.0F/std::sqrt(len2);
+              return {q.x*s, q.y*s, q.z*s, q.w*s};
+          }
+          [[nodiscard]] XrQuaternionf xrfg_pose_mul(
+              const XrQuaternionf& a, const XrQuaternionf& b) noexcept {
+              return {a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,
+                      a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,
+                      a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w,
+                      a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z};
+          }
+          [[nodiscard]] XrQuaternionf xrfg_pose_between(
+              XrQuaternionf previous, XrQuaternionf current, float fraction) noexcept {
+              previous=xrfg_pose_normalize(previous);
+              current=xrfg_pose_normalize(current);
+              // q = inverse(B) * A, the same relative camera transform the pixel
+              // shader derives by conjugating its camera mapping A^-1 * B.
+              const XrQuaternionf inverse_current{-current.x,-current.y,-current.z,current.w};
+              XrQuaternionf relative=xrfg_pose_normalize(xrfg_pose_mul(inverse_current,previous));
+              if (relative.w < 0) {
+                  relative={-relative.x,-relative.y,-relative.z,-relative.w};
+              }
+              // Keep the original B pose on >30 degree jumps and invalid fractions.
+              // The shader uses the identical threshold and normalization.
+              if (!(relative.w >= 0.9659258F) || !std::isfinite(fraction) ||
+                  !(fraction > 0.0F && fraction < 1.0F)) return current;
+              const float blend=1.0F-fraction;
+              XrQuaternionf mid_relative=xrfg_pose_normalize({relative.x*blend,
+                  relative.y*blend,relative.z*blend,1.0F+(relative.w-1.0F)*blend});
+              return xrfg_pose_normalize(xrfg_pose_mul(current,mid_relative));
+          }
+          
+          '''
+          
+          APP_FUNCTION = '''[[nodiscard]] bool build_generated_frame_end_info(
+              const XrFrameEndInfo* source,
+              const ProjectionSnapshot& current_snapshot,
+              bool synthetic,
+              std::span<const ProjectionResourceDestination> destinations,
+              GeneratedFrameEndInfo* output) {'''
+          APP_FUNCTION_REPLACEMENT = '''[[nodiscard]] bool build_generated_frame_end_info(
+              const XrFrameEndInfo* source,
+              const ProjectionSnapshot& current_snapshot,
+              bool synthetic,
+              std::span<const ProjectionResourceDestination> destinations,
+              GeneratedFrameEndInfo* output,
+              const ProjectionSnapshot* prior_snapshot = nullptr,
+              float synthetic_fraction = 1.0F) {'''
+          VIEW_ANCHOR = '''            view.subImage.swapchain = destination->destination_swapchain;
+                      if (synthetic) {
+                          // The V008 shader generates the synthetic image in B's camera'''
+          VIEW_REPLACE = '''            view.subImage.swapchain = destination->destination_swapchain;
+                      if (synthetic && xrfg_pose_is_msfs() && prior_snapshot != nullptr &&
+                          projection_index < prior_snapshot->layers.size() &&
+                          view_index < prior_snapshot->layers[projection_index].views.size()) {
+                          // Source pixels are rotationally warped from this synthetic
+                          // orientation into B by the HLSL before regular interpolation.
+                          // Both must change together. Keep position B, not an invented
+                          // depth-adjusted positional pose.
+                          const auto& prior_view =
+                              prior_snapshot->layers[projection_index].views[view_index];
+                          view.pose.orientation = xrfg_pose_between(
+                              prior_view.pose.orientation,
+                              projection->views[view_index].pose.orientation,
+                              synthetic_fraction);
+                          static std::atomic<std::uint64_t> pose_samples{0};
+                          if (view_index == 0 &&
+                              pose_samples.fetch_add(1, std::memory_order_relaxed) % 90 == 0) {
+                              // 993: a=fraction in millionths, b=generated display time,
+                              // c=0 denotes orientation-only B-position re-projection.
+                              xrfg::bridge_flight_logger().event(
+                                  xrfg::BridgeFlightOperation::presenter_transition,
+                                  993,
+                                  static_cast<std::uint64_t>(synthetic_fraction*1000000.0F),
+                                  static_cast<std::uint64_t>(source->displayTime), 0);
+                          }
+                      }
+                      if (synthetic) {
+                          // The V008 shader generates the synthetic image in B's camera'''
+          
+          # Source comment following the injected line is updated: this frame is no
+          # longer in B camera orientation when the mode is enabled.
+          VIEW_OLD_COMMENT = '''                // The V008 shader generates the synthetic image in B's camera
+                          // reference. Its projection metadata must therefore remain
+                          // B's render pose/FOV.'''
+          VIEW_NEW_COMMENT = '''                // Stock: B-camera render pose. MSFS pose-aligned mode:
+                          // orientation is matched to the intermediate-pose pixel warp;
+                          // position and FOV remain B because no depth was supplied.'''
+          
+          FIRST_CALL = '''            &first_generated);
+                  const bool current_built = build_generated_frame_end_info('''
+          FIRST_REPLACE = '''            &first_generated, &*previous_snapshot, interpolation_fraction);
+                  const bool current_built = build_generated_frame_end_info('''
+          EXTRA_CALL = '''                    &extra_generated[extra])) {'''
+          EXTRA_REPLACE = '''                    &extra_generated[extra], &*previous_snapshot,
+                              extra_fractions[extra])) {'''
+          
+          SYNTH_FUNC = '[[nodiscard]] constexpr UINT packed_synthesis_fraction(float fraction) noexcept {'
+          SYNTH_FLAGS_BASE = '''        parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |
+                      pack_input_flags(view_format) | (flat_panel ? kFlatPanelFlag : 0U);'''
+          SYNTH_FLAGS_REPLACE = '''        // HLSL bit 30: maps synthetic output pixels from their interpolated
+                  // orientation to B while the OpenXR layer supplies that same pose.
+                  // All CTest programs and non-MSFS applications remain baseline V577.
+                  parameters.synthesis_flags = packed_synthesis_fraction(synthetic_fraction) |
+                      pack_input_flags(view_format) | (flat_panel ? kFlatPanelFlag : 0U) |
+                      (xrfg_pose_is_msfs() ? (1U << 30U) : 0U);'''
+          
+          SHADER_ANCHOR = '''        float2 pixel = float2(integer_pixel);
+                  CameraSample current_fallback = sample_current_target('''
+          SHADER_REPLACE = '''        float2 pixel = float2(integer_pixel);
+                  // Frame-space pose alignment for MSFS/TAA/FidelityFX only.
+                  // The image produced at an intermediate instant must be expressed
+                  // in the intermediate camera orientation that OpenXR will receive.
+                  // PreviousMappings maps from B into A: inverse maps A into B.
+                  // The intermediate-to-B rotation is nlerp(I, inverse(A^-1 B), 1-t).
+                  // The metadata uses the identical quaternion formula.
+                  [branch] if ((SynthesisFlags & (1u << 30u)) != 0u &&
+                               !use_nvidia_cost && !use_game_motion_pipeline) {
+                      CameraMapping synthetic_to_b = PreviousMappings[ViewIndex];
+                      float4 relative = float4(
+                          -synthetic_to_b.TargetToSourceRotation.xyz,
+                          synthetic_to_b.TargetToSourceRotation.w);
+                      if (relative.w < 0.0) relative = -relative;
+                      if (relative.w >= 0.9659258 &&
+                          synthesis_fraction() > 0.0 && synthesis_fraction() < 1.0) {
+                          float weight = 1.0 - synthesis_fraction();
+                          synthetic_to_b.TargetToSourceRotation = normalize(float4(
+                              relative.xyz * weight,
+                              1.0 + (relative.w - 1.0) * weight));
+                          synthetic_to_b.SourceTangents = synthetic_to_b.TargetTangents;
+                          synthetic_to_b.SourceRect = synthetic_to_b.TargetRect;
+                          MappedCoordinate b_pixel = map_target_to_source(pixel, synthetic_to_b);
+                          if (b_pixel.valid >= 0.5) pixel = b_pixel.coordinate;
+                      }
+                  }
+                  CameraSample current_fallback = sample_current_target('''
+          
+          
+          def build(mode:str,root:Path):
+              paths = {k:root/v for k,v in [('app',APP),('synth',SYNTH),('shader',SHADER)]}
+              src={k:p.read_text(encoding='utf-8').replace('\r\n','\n') for k,p in paths.items()}
+              # Validate stock exact-source anchors even for mode=stock.
+              anchors = [(src['app'],APP_FUNCTION,'builder'),(src['app'],VIEW_ANCHOR,'view'),
+                         (src['app'],VIEW_OLD_COMMENT,'pose-comment'),(src['app'],FIRST_CALL,'first'),
+                         (src['app'],EXTRA_CALL,'extra'),(src['synth'],SYNTH_FUNC,'flag location'),
+                         (src['shader'],SHADER_ANCHOR,'shader branch')]
+              for content,needle,label in anchors:
+                  if content.count(needle)!=1: raise RuntimeError(f'FAIL CLOSED anchor {label} count {content.count(needle)}')
+              if src['synth'].count(SYNTH_FLAGS_BASE)!=2:
+                  raise RuntimeError('FAIL CLOSED: expected exactly two pack flag sites (NVIDIA then FidelityFX)')
+              if mode=='stock':
+                  print('Stock V577 source anchor checks passed; no changes.')
+                  return
+              app=src['app']; synth=src['synth']; shader=src['shader']
+              app=once(app,APP_FUNCTION,POSE_HELPERS+APP_FUNCTION_REPLACEMENT,'builder + quaternion')
+              app=once(app,VIEW_ANCHOR,VIEW_REPLACE,'coupled pose metadata')
+              app=once(app,VIEW_OLD_COMMENT,VIEW_NEW_COMMENT,'source comment')
+              app=once(app,FIRST_CALL,FIRST_REPLACE,'first synthetic fraction')
+              app=once(app,EXTRA_CALL,EXTRA_REPLACE,'other synthetic fractions')
+              # First use of process gate is in build_generated_frame_end_info, above this insert.
+              app=once(app,'[[nodiscard]] bool build_generated_frame_end_info(',PROCESS+'[[nodiscard]] bool build_generated_frame_end_info(','process gate before call')
+              synth=once(synth,SYNTH_FUNC,PROCESS+SYNTH_FUNC,'synth process helper')
+              # Modify only the FidelityFX occurrence: on V577 the NVIDIA pack flags
+              # appear first, FidelityFX second.
+              # split returns three parts; use rsplit to affect only the last.
+              synth=synth.rsplit(SYNTH_FLAGS_BASE,1)[0]+SYNTH_FLAGS_REPLACE+synth.rsplit(SYNTH_FLAGS_BASE,1)[1]
+              shader=once(shader,SHADER_ANCHOR,SHADER_REPLACE,'intermediate camera to B pixel warp')
+              for k,new in [('app',app),('synth',synth),('shader',shader)]:
+                  if new==src[k]: raise RuntimeError(f'Missing diff for {k}')
+                  paths[k].write_text(new,encoding='utf-8',newline='\n')
+              # Always ensure both sides of metadata/image change are present.
+              assert 'view.pose.orientation = xrfg_pose_between(' in app
+              assert 'MAPPED_FAKE_TEST_NEVER_MATCHES' not in shader
+              assert 'b_pixel = map_target_to_source' in shader
+              assert '(1U << 30U)' in synth and '(1u << 30u)' in shader
+              print(f'Applied pose-aligned patch to pinned {PINNED} (MSFS-only; 3 files)')
+          
+          if __name__=='__main__':
+              parser=argparse.ArgumentParser()
+              parser.add_argument('--root',type=Path,required=True)
+              parser.add_argument('--mode',choices=['stock','pose-aligned'],required=True)
+              args=parser.parse_args()
+              build(args.mode,args.root)
+          '@ | Set-Content -Path apply_pose_aligned.py -Encoding utf8
+          python -m py_compile apply_pose_aligned.py
+          if ($LASTEXITCODE -ne 0) { throw 'Patcher syntax failed' }
+          python apply_pose_aligned.py --root . --mode stock
+          if ($LASTEXITCODE -ne 0) { throw 'Source anchor validation failed' }
+          @'
+          #!/usr/bin/env python3
+          """Independent CPU oracle for the paired HLSL / OpenXR pose mapping.
+          Does NOT establish the rendering quality of an actual headset frame.
+          """
+          import math
+          import random
+          
+          def norm(q):
+              n=math.sqrt(sum(v*v for v in q))
+              return tuple(v/n for v in q)
+          
+          def mul(a,b):
+              x,y,z,w=a;X,Y,Z,W=b
+              return (w*X+x*W+y*Z-z*Y,w*Y-x*Z+y*W+z*X,
+                      w*Z+x*Y-y*X+z*W,w*W-x*X-y*Y-z*Z)
+          
+          def inv(q): return (-q[0],-q[1],-q[2],q[3])
+          
+          def pose_cpp(a,b,t):
+              rel=norm(mul(inv(norm(b)),norm(a)))
+              if rel[3]<0: rel=tuple(-v for v in rel)
+              if rel[3]<0.9659258 or not 0<t<1: return norm(b)
+              w=1-t
+              mix=norm((rel[0]*w,rel[1]*w,rel[2]*w,1+(rel[3]-1)*w))
+              return norm(mul(norm(b),mix))
+          
+          def shader_mid_to_b(a,b,t):
+              # In C++ CameraMapping.TargetToSourceRotation = inverse(A) * B.
+              b_to_a=norm(mul(inv(norm(a)),norm(b)))
+              rel=inv(b_to_a)
+              if rel[3]<0: rel=tuple(-v for v in rel)
+              if rel[3]<0.9659258 or not 0<t<1: return (0,0,0,1)
+              w=1-t
+              return norm((rel[0]*w,rel[1]*w,rel[2]*w,1+(rel[3]-1)*w))
+          
+          def quat_yaw(degrees):
+              r=math.radians(degrees)/2
+              return (0,math.sin(r),0,math.cos(r))
+          
+          def diff(a,b): return min(max(abs(v-w) for v,w in zip(a,b)),max(abs(v+w) for v,w in zip(a,b)))
+          
+          for da in [-25,-12,-3,0,3,12,25,35,60]:
+              a=quat_yaw(0)
+              b=quat_yaw(da)
+              for fraction in [1/3,2/3,0.47]:
+                  meta=pose_cpp(a,b,fraction)
+                  shader=shader_mid_to_b(a,b,fraction)
+                  expected=norm(mul(norm(b),shader))
+                  assert diff(meta,expected)<1e-6,(da,fraction,meta,expected)
+                  if abs(da)>30:
+                      assert diff(meta,b)<1e-6
+          random.seed(577)
+          for _ in range(2000):
+              a=norm(tuple(random.uniform(-1,1) for _ in range(4)))
+              b=norm(mul(a,quat_yaw(random.uniform(-25,25))))
+              t=random.uniform(.05,.95)
+              meta=pose_cpp(a,b,t)
+              expected=norm(mul(b,shader_mid_to_b(a,b,t)))
+              assert diff(meta,expected)<2e-6,(a,b,t)
+          print('PASS: intermediate OpenXR orientation and shader-to-B quaternion mapping agree for 2027 cases')
+          '@ | Set-Content -Path test_pose_math.py -Encoding utf8
+          python test_pose_math.py
+          if ($LASTEXITCODE -ne 0) { throw 'Pose transform unit tests failed' }
+
+      - name: Cache the FidelityFX SDK libraries
+        id: ffx-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.FFX_ROOT }}/sdk/include
+            ${{ env.FFX_ROOT }}/sdk/bin/ffx_sdk
+          key: ffx-${{ env.FFX_COMMIT }}-of-dx12-static-vs2022-x64-v1
+
+      - name: Build FidelityFX SDK 1.1.4 when not cached
+        if: steps.ffx-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --branch $env:FFX_TAG --depth 1 `
+            https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git $env:FFX_ROOT
+          $head = (git -C $env:FFX_ROOT rev-parse HEAD).Trim()
+          if ($head -ne $env:FFX_COMMIT) { throw "FidelityFX tag moved: $head" }
+          cmake -S "$env:FFX_ROOT/sdk" -B build-fidelityfx -G "Visual Studio 17 2022" -A x64 `
+            -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX configure failed' }
+          cmake --build build-fidelityfx --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX build failed' }
+          foreach ($lib in 'ffx_backend_dx12_x64.lib', 'ffx_opticalflow_x64.lib') {
+            if (-not (Test-Path "$env:FFX_ROOT/sdk/bin/ffx_sdk/$lib")) { throw "Missing $lib" }
+          }
+
+      - name: Fetch pinned NVIDIA DLSS headers
+        shell: pwsh
+        env:
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git -c advice.detachedHead=false clone --branch $env:DLSS_TAG --depth 1 `
+            --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
+          if ($LASTEXITCODE -ne 0) { throw 'DLSS clone failed' }
+          git -C external/DLSS sparse-checkout set include
+          $head = (git -C external/DLSS rev-parse HEAD).Trim()
+          if ($head -ne $env:DLSS_COMMIT) { throw "DLSS tag moved: $head" }
+          if (-not (Test-Path external/DLSS/include/nvsdk_ngx_params.h)) { throw 'Missing NGX headers' }
+
+      - name: Fetch pinned OpenVR header
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force external/openvr | Out-Null
+          curl.exe -fsSL -o external/openvr/openvr.h `
+            "https://raw.githubusercontent.com/ValveSoftware/openvr/$env:OPENVR_TAG/headers/openvr.h"
+          if ($LASTEXITCODE -ne 0) { throw 'OpenVR header download failed' }
+          $hash = (Get-FileHash external/openvr/openvr.h -Algorithm SHA256).Hash
+          if ($hash -ne $env:OPENVR_SHA256) { throw "OpenVR checksum mismatch: $hash" }
+
+      - name: Find original Microsoft fxc shader compiler
+        id: fxc
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\fxc.exe' -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'No fxc.exe found in Windows SDK' }
+          "path=$($fxc.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Using: $($fxc.FullName)"
+
+      - name: Compile both complete release variants and run all CI-compatible CTests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'dist/OFXR-V577-PoseAligned'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $modes = @('01-stock', '02-pose-aligned')
+          $hashes = @{}
+          foreach ($mode in $modes) {
+            git checkout -- src/layer/openxr_layer.cpp src/d3d12/frame_synthesis.hlsl src/d3d12/d3d12_frame_synthesizer.cpp
+            if ($LASTEXITCODE -ne 0) { throw 'Source restore failed' }
+            $setting = if ($mode -eq '01-stock') { 'stock' } else { 'pose-aligned' }
+            python apply_pose_aligned.py --root . --mode $setting
+            if ($LASTEXITCODE -ne 0) { throw "Patcher refused $mode" }
+            git diff --check
+            if ($LASTEXITCODE -ne 0) { throw "Source diff verification failed: $mode" }
+            $dir = "$root/$mode"
+            New-Item -ItemType Directory -Force "$dir/ofxr", "$dir/licenses", `
+              "$dir/external/OpenXR-SDK/LICENSES", "$dir/external/Vulkan-Headers" | Out-Null
+            git diff --binary -- src/layer/openxr_layer.cpp src/d3d12/d3d12_frame_synthesizer.cpp src/d3d12/frame_synthesis.hlsl |
+              Out-File -Encoding utf8 "$dir/SOURCE_CHANGE.patch"
+            $build = "build-pose-$mode"
+            cmake -S . -B $build -G 'Visual Studio 17 2022' -A x64 `
+                -DXRFG_FXC_EXECUTABLE="${{ steps.fxc.outputs.path }}"
+            if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $mode" }
+            cmake --build $build --config Release --parallel
+            if ($LASTEXITCODE -ne 0) { throw "MSVC or fxc compilation failed: $mode" }
+            & ctest --test-dir $build -C Release --output-on-failure `
+                --timeout 300 -LE needs_gpu_timing | Tee-Object -FilePath "$dir/TESTS.txt"
+            if ($LASTEXITCODE -ne 0) { throw "CTest regression: $mode" }
+            Copy-Item "$build/Release/OFXRBridgeTray.exe" $dir
+            Copy-Item "$build/Release/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll", `
+              "$build/Release/ofxr/OFXR_vulkan_queue_layer.dll", `
+              "$build/Release/ofxr/ofxr_bridge.ini" "$dir/ofxr"
+            Copy-Item README.md, LICENSE, THIRD_PARTY.md $dir
+            Copy-Item licenses/* "$dir/licenses"
+            Copy-Item external/OpenXR-SDK/LICENSES/* "$dir/external/OpenXR-SDK/LICENSES"
+            Copy-Item external/Vulkan-Headers/LICENSE.md "$dir/external/Vulkan-Headers"
+            @"
+          MODE=$mode
+          UPSTREAM=$env:UPSTREAM_COMMIT
+          STOCK untouched or experimental MSFS-only coupled synthetic camera orientation + HLSL pixel reprojection.
+          TAA + FidelityFX, 3X 72Hz, VDXR, SSW off.
+          NO full 6DoF: no positional/depth reprojection; keep stock rollback.
+          "@ | Set-Content -Encoding utf8 "$dir/VARIANT.txt"
+            $dll = "$dir/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll"
+            $hashes[$mode] = (Get-FileHash $dll -Algorithm SHA256).Hash
+            "$mode DLL_SHA256=$($hashes[$mode])" | Set-Content -Encoding ascii "$dir/BUILD_SHA256.txt"
+            Remove-Item -Recurse -Force $build
+          }
+          if (@($hashes.Values | Sort-Object -Unique).Count -ne 2) {
+            throw 'Variant DLL SHA256 hashes are equal; patch may not have built'
+          }
+          Copy-Item apply_pose_aligned.py "$root/PATCHER_SOURCE.py"
+          Copy-Item test_pose_math.py "$root/POSE_MATH_TESTS.py"
+          $env:UPSTREAM_COMMIT | Set-Content -Encoding ascii "$root/UPSTREAM_COMMIT.txt"
+
+      - name: Audit compiled EXEs and DLLs with Microsoft Defender
+        shell: pwsh
+        run: |
+          # This step DOES NOT assert that an unsigned binary is safe.
+          # Fail closed if on-runner anti-malware scanning is unavailable.
+          $ErrorActionPreference = 'Stop'
+          $auditRoot = 'dist/security-audit'
+          New-Item -ItemType Directory -Force $auditRoot | Out-Null
+          $report = Join-Path $auditRoot 'SecurityAudit.txt'
+          $lines = [System.Collections.Generic.List[string]]::new()
+          function Record([string] $message) {
+            $lines.Add($message)
+            Write-Host $message
+            $lines | Set-Content -Path $report -Encoding utf8
+          }
+          Record ('OFXR V577 pose-aligned Windows binary security audit; UTC: ' + (Get-Date).ToUniversalTime().ToString('o'))
+          Record ('Workflow: ' + $env:GITHUB_WORKFLOW)
+          Record ('Runner: ' + $env:RUNNER_OS)
+          Record ('Commit: ' + $env:UPSTREAM_COMMIT)
+          $root = (Resolve-Path 'dist/OFXR-V577-PoseAligned').Path
+          $binaries = @(Get-ChildItem $root -Recurse -File | Where-Object {
+            $_.Extension -in @('.exe', '.dll')
+          } | Sort-Object FullName)
+          Record ('Binary count: ' + $binaries.Count)
+          if ($binaries.Count -ne 6) { throw 'Expected two EXEs and four DLLs' }
+          foreach ($binary in $binaries) {
+            $rel = $binary.FullName.Substring($root.Length + 1).Replace('\','/')
+            Record ('BIN SHA256=' + (Get-FileHash $binary.FullName -Algorithm SHA256).Hash + '  ' + $rel)
+          }
+          if (-not (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) -or
+              -not (Get-Command Start-MpScan -ErrorAction SilentlyContinue) -or
+              -not (Get-Command Get-MpThreatDetection -ErrorAction SilentlyContinue)) {
+            Record 'INDETERMINATE: Microsoft Defender scanning cmdlets are unavailable on this runner'
+            throw 'Security audit unavailable. Binary artifact not uploaded.'
+          }
+          try {
+            $status = Get-MpComputerStatus -ErrorAction Stop
+            Record ('Defender AMServiceEnabled=' + $status.AMServiceEnabled +
+              ' AntivirusEnabled=' + $status.AntivirusEnabled +
+              ' SignatureLastUpdated=' + $status.AntivirusSignatureLastUpdated)
+            if (-not $status.AMServiceEnabled -or -not $status.AntivirusEnabled) {
+              Record 'INDETERMINATE: Microsoft Defender Antivirus is disabled on this runner'
+              throw 'Security audit unavailable. Binary artifact not uploaded.'
+            }
+            if ($null -eq $status.AntivirusSignatureLastUpdated -or
+                $status.AntivirusSignatureLastUpdated -lt (Get-Date).AddDays(-14)) {
+              Record 'INDETERMINATE: Antivirus signatures are older than 14 days'
+              throw 'Defender signatures too old to permit artifact upload.'
+            }
+            $auditStart = (Get-Date).AddMinutes(-30)
+            foreach ($binary in $binaries) {
+              Record ('Scanning ' + $binary.FullName)
+              Start-MpScan -ScanType CustomScan -ScanPath $binary.FullName -ErrorAction Stop
+              if (-not (Test-Path -LiteralPath $binary.FullName)) {
+                Record ('DETECTION OR QUARANTINE: binary disappeared after scanning: ' + $binary.Name)
+                throw 'Security scan removed a file. Binary artifact not uploaded.'
+              }
+            }
+            $detections = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object {
+              $_.InitialDetectionTime -ge $auditStart
+            })
+            foreach ($detection in $detections) {
+              Record ('DETECTION: ThreatID=' + $detection.ThreatID +
+                ' Time=' + $detection.InitialDetectionTime +
+                ' Resources=' + ($detection.Resources -join ';'))
+            }
+            if ($detections.Count -gt 0) {
+              throw 'Defender reported detections. Binary artifact not uploaded.'
+            }
+            Record 'SCAN RESULT: no recent detections returned by Microsoft Defender on this runner.'
+            Record 'LIMITATION: a clean scan is NOT proof of safety; browser warning may remain.'
+          } catch {
+            Record ('AUDIT FAILED: ' + $_.Exception.Message)
+            throw
+          }
+
+      - name: Upload source-only security audit report (no binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-V577-SECURITY-AUDIT-TEXT-ONLY
+          path: dist/security-audit/SecurityAudit.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload stock and pose-aligned variants only after Defender audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-V577-PoseAligned-UNSIGNED
+          path: dist/OFXR-V577-PoseAligned/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostic logs if build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-PoseAligned-failed-build-logs
+          path: |
+            build-pose-*/Testing/Temporary/LastTest.log
+            build-pose-*/Testing/Temporary/*.log
+            build-pose-*/CMakeFiles/CMakeConfigureLog.yaml
+            dist/OFXR-V577-PoseAligned/*/SOURCE_CHANGE.patch
+            dist/OFXR-V577-PoseAligned/*/TESTS.txt
+          if-no-files-found: ignore
