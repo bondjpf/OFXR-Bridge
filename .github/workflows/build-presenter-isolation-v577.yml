@@ -1,0 +1,475 @@
+name: OFXR V577 Presenter vs Synthetic Image Isolation (security audit)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_COMMIT: 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e
+  FFX_TAG: v1.1.4
+  FFX_COMMIT: c6efa6bf7f2027b3ec94f28578bb5965eabb9e55
+  FFX_ROOT: external/FidelityFX-SDK-v1.1.4
+  DLSS_TAG: v310.9.1
+  DLSS_COMMIT: 374959484e79a640feaba44c93ac8cfb0a03f5b5
+  OPENVR_TAG: v2.5.1
+  OPENVR_SHA256: 94E5545370159C85F87CD6E15DD3739F7C919FC7A6E869F5E4ED463533A07ED0
+
+jobs:
+  experimental-build:
+    name: Windows x64 build, test and package
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out exact upstream 0.2.14.3 (V577)
+        uses: actions/checkout@v4
+        with:
+          repository: djules75/OFXR-Bridge
+          ref: 0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e
+          persist-credentials: false
+
+      - name: Verify upstream commit
+        shell: pwsh
+        run: |
+          $hash = (git rev-parse HEAD).Trim()
+          if ($hash -ne $env:UPSTREAM_COMMIT) { throw "Unexpected upstream commit: $hash" }
+          Write-Host "Pinned upstream: $hash"
+
+      - name: Validate and install pinned V577 experiment source patcher
+        shell: pwsh
+        run: |
+          @'
+          #!/usr/bin/env python3
+          """Fail-closed, exact-commit source transformations for OFXR V577.
+          
+          Modes:
+            stock: no source change
+            presenter-only: make every frame a PRIME copy, no synthetic pair.
+            direct-current: synthesize synthetic RT from B/current image with no optical-flow result.
+          
+          This tool intentionally does not copy arbitrary OpenXR next chains into synthetic
+          frames; some contain swapchain-specific depth attachments. It adds sampled
+          metadata telemetry and preserves the existing B-pose/FOV model.
+          """
+          from __future__ import annotations
+          import argparse
+          from pathlib import Path
+          
+          APP_REL = Path('src/layer/openxr_layer.cpp')
+          SHADER_REL = Path('src/d3d12/frame_synthesis.hlsl')
+          PAIR_ANCHOR_ONE = 'const bool metadata_pairable =\n        latest_application_frame && previous_snapshot && snapshots_compatible;'
+          SHADER_ANCHOR = '''float4 SynthesizeMidpointPS(FullscreenVertex input) : SV_Target {
+              return synthesize_midpoint(input, 1.0, false, false, false, false, false);
+          }'''
+          SHADER_REPLACEMENT = '''// DIAGNOSTIC: intentionally feed the real B image through the synthetic
+          // render target and the normal V577 synthetic submit path. No optical-flow
+          // movement in the resulting pixels. The GPU flow pass may still run; this
+          // isolates the presented image, not the compute cost of the whole pipeline.
+          float4 SynthesizeMidpointPS(FullscreenVertex input) : SV_Target {
+              return CurrentFrame.Load(int4(int2(input.position.xy), int(Slice), 0));
+          }'''
+          
+          # Capture metadata BEFORE the existing V577 synthetic next-chain removal.
+          # The original per-eye camera pose and FOV are left unchanged by the code.
+          META_ANCHOR = '''            view.subImage.swapchain = destination->destination_swapchain;
+                      if (synthetic) {
+                          // The V008 shader generates the synthetic image in B's camera'''
+          META_REPLACEMENT = '''            view.subImage.swapchain = destination->destination_swapchain;
+                      // Diagnostic 988: per-eye source metadata, sampled ~once every
+                      // 90 constructed frames. a=layer index (high 32), eye (low 32).
+                      // b=source chain type (high 32), presence bits (low 32):
+                      // 1 synthetic, 2 source view next, 4 source layer next.
+                      // c=original application display time. Does not retain chains.
+                      if (diagnostic_metadata_sample) {
+                          const auto* source_next = reinterpret_cast<
+                              const XrBaseInStructure*>(projection->views[view_index].next);
+                          const std::uint64_t flags = (synthetic ? 1ULL : 0ULL) |
+                              (source_next ? 2ULL : 0ULL) |
+                              (projection->next ? 4ULL : 0ULL);
+                          const std::uint64_t chain_type = source_next
+                              ? static_cast<std::uint64_t>(source_next->type) : 0ULL;
+                          xrfg::bridge_flight_logger().event(
+                              xrfg::BridgeFlightOperation::presenter_transition, 988,
+                              (static_cast<std::uint64_t>(metadata.layer_index) << 32) |
+                                  static_cast<std::uint64_t>(view_index),
+                              (chain_type << 32) | flags,
+                              static_cast<std::uint64_t>(current_snapshot.display_time));
+                      }
+                      if (synthetic) {
+                          // The V008 shader generates the synthetic image in B's camera'''
+          META_START = '''    output->info = *source;
+              output->layer_pointers.assign('''
+          META_START_REPLACEMENT = '''    // Limit per-frame telemetry to avoid perturbing frame timing.
+              static std::atomic<std::uint64_t> diagnostic_metadata_counter{0};
+              const bool diagnostic_metadata_sample =
+                  diagnostic_metadata_counter.fetch_add(1, std::memory_order_relaxed) % 90 == 0;
+              if (diagnostic_metadata_sample) {
+                  // Diagnostic 990: variant ID 1=PRIME-only, 2=B-image synthetic.
+                  xrfg::bridge_flight_logger().event(
+                      xrfg::BridgeFlightOperation::presenter_transition, 990, @@MODE@@,
+                      static_cast<std::uint64_t>(source->displayTime), 0);
+              }
+              output->info = *source;
+              output->layer_pointers.assign('''
+          
+          # Presenter ownership clears next pointers independently of synthetic flag;
+          # record that separately so the diagnostic doesn't mistake the original
+          # source's depth extension for an attached synthetic depth image.
+          OWN_ANCHOR = '''        projection.layer.next = nullptr;
+                  for (XrCompositionLayerProjectionView& view : projection.views) {
+                      view.next = nullptr;
+                  }'''
+          OWN_REPLACE = '''        // Diagnostic 989: before/after ownership metadata chain handling.
+                  // a=layer index, b=pre-ownership layer next bit 0, number of eye
+                  // views with next attachments bits 8+, c=post-ownership chain count
+                  // (always zero, enforced by the existing V577 operation below).
+                  if (diagnostic_owner_sample) {
+                      std::uint64_t before = projection.layer.next ? 1ULL : 0ULL;
+                      for (const auto& original_view : projection.views) {
+                          if (original_view.next) before += 1ULL << 8;
+                      }
+                      xrfg::bridge_flight_logger().event(
+                          xrfg::BridgeFlightOperation::presenter_transition, 989,
+                          projection.layer_index, before, 0);
+                  }
+                  projection.layer.next = nullptr;
+                  for (XrCompositionLayerProjectionView& view : projection.views) {
+                      view.next = nullptr;
+                  }'''
+          OWNER_COUNTER_ANCHOR = '''    auto output = std::make_shared<GeneratedFrameEndInfo>(std::move(source));
+              std::vector<bool> projection_indices'''
+          OWNER_COUNTER_REPLACEMENT = '''    static std::atomic<std::uint64_t> diagnostic_owner_counter{0};
+              const bool diagnostic_owner_sample =
+                  diagnostic_owner_counter.fetch_add(1, std::memory_order_relaxed) % 90 == 0;
+              auto output = std::make_shared<GeneratedFrameEndInfo>(std::move(source));
+              std::vector<bool> projection_indices'''
+          
+          def replace_once(content: str, old: str, new: str, name: str) -> str:
+              found = content.count(old)
+              if found != 1:
+                  raise RuntimeError(f'FAIL CLOSED: {name}: expected 1 exact anchor, found {found}')
+              return content.replace(old, new, 1)
+          
+          def edit(path: Path, transformer):
+              original = path.read_text(encoding='utf-8')
+              normalized = original.replace('\r\n', '\n')
+              edited = transformer(normalized)
+              if edited == normalized:
+                  raise RuntimeError(f'No source change in {path}')
+              path.write_text(edited, encoding='utf-8', newline='\n')
+          
+          
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--root', type=Path, required=True)
+              parser.add_argument('--mode', choices=('stock', 'presenter-only', 'direct-current'), required=True)
+              args = parser.parse_args()
+              root = args.root.resolve()
+              app = root / APP_REL
+              shader = root / SHADER_REL
+              # Check exact V577 anchors even if compiling an unmodified control.
+              a = app.read_text(encoding='utf-8').replace('\r\n', '\n')
+              h = shader.read_text(encoding='utf-8').replace('\r\n', '\n')
+              for label, content, anchor in (
+                  ('application pair condition', a, PAIR_ANCHOR_ONE),
+                  ('FidelityFX pixel entrypoint', h, SHADER_ANCHOR),
+                  ('projection metadata extraction', a, META_ANCHOR),
+                  ('projection info allocation', a, META_START),
+                  ('ownership projection chain', a, OWN_ANCHOR),
+                  ('ownership sample insertion', a, OWNER_COUNTER_ANCHOR),
+              ):
+                  if content.count(anchor) != 1:
+                      raise SystemExit(f'FAIL CLOSED: pinned V577 {label} not found exactly once')
+              if args.mode == 'stock':
+                  print('STOCK: V577 exact source, no instrumentation or changes')
+                  return
+          
+              def patch_app(content: str) -> str:
+                  content = replace_once(content, OWNER_COUNTER_ANCHOR, OWNER_COUNTER_REPLACEMENT, 'owner sampling start')
+                  content = replace_once(content, OWN_ANCHOR, OWN_REPLACE, 'owner chains trace')
+                  content = replace_once(content, META_START,
+                      META_START_REPLACEMENT.replace('@@MODE@@',
+                          '1' if args.mode == 'presenter-only' else '2'),
+                      'metadata sampling start')
+                  content = replace_once(content, META_ANCHOR, META_REPLACEMENT, 'metadata tracing')
+                  if args.mode == 'presenter-only':
+                      # Keep V577's normal PRIME copy and 3X virtual-display timeline.
+                      # Presenter repeats its last owned real image in empty slots;
+                      # no generated image / optical-flow composition is submitted.
+                      content = replace_once(content, PAIR_ANCHOR_ONE,
+                          '''// DIAGNOSTIC: always produce PRIME/current copies. The normal
+              // presenter repeats the last owned real frame for the other 3X slots.
+              const bool metadata_pairable = false;''', 'presenter-only prime mode')
+                  return content
+          
+              edit(app, patch_app)
+              if args.mode == 'direct-current':
+                  edit(shader, lambda s: replace_once(s, SHADER_ANCHOR,
+                                    SHADER_REPLACEMENT, 'synthetic direct B image'))
+              print('Applied pinned V577 diagnostic:', args.mode)
+              print('NOTE: synthetic OpenXR view-next attachments remain stripped by V577 for safety.')
+          
+          if __name__ == '__main__':
+              main()
+          '@ | Set-Content -Path apply_diagnostic.py -Encoding utf8
+          python -m py_compile apply_diagnostic.py
+          if ($LASTEXITCODE -ne 0) { throw 'Source patcher syntax invalid' }
+          python apply_diagnostic.py --root . --mode stock
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned source anchors changed' }
+
+      - name: Cache the FidelityFX SDK libraries
+        id: ffx-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.FFX_ROOT }}/sdk/include
+            ${{ env.FFX_ROOT }}/sdk/bin/ffx_sdk
+          key: ffx-${{ env.FFX_COMMIT }}-of-dx12-static-vs2022-x64-v1
+
+      - name: Build FidelityFX SDK 1.1.4 when not cached
+        if: steps.ffx-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --branch $env:FFX_TAG --depth 1 `
+            https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git $env:FFX_ROOT
+          $head = (git -C $env:FFX_ROOT rev-parse HEAD).Trim()
+          if ($head -ne $env:FFX_COMMIT) { throw "FidelityFX tag moved: $head" }
+          cmake -S "$env:FFX_ROOT/sdk" -B build-fidelityfx -G "Visual Studio 17 2022" -A x64 `
+            -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX configure failed' }
+          cmake --build build-fidelityfx --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'FidelityFX build failed' }
+          foreach ($lib in 'ffx_backend_dx12_x64.lib', 'ffx_opticalflow_x64.lib') {
+            if (-not (Test-Path "$env:FFX_ROOT/sdk/bin/ffx_sdk/$lib")) { throw "Missing $lib" }
+          }
+
+      - name: Fetch pinned NVIDIA DLSS headers
+        shell: pwsh
+        env:
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git -c advice.detachedHead=false clone --branch $env:DLSS_TAG --depth 1 `
+            --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git external/DLSS
+          if ($LASTEXITCODE -ne 0) { throw 'DLSS clone failed' }
+          git -C external/DLSS sparse-checkout set include
+          $head = (git -C external/DLSS rev-parse HEAD).Trim()
+          if ($head -ne $env:DLSS_COMMIT) { throw "DLSS tag moved: $head" }
+          if (-not (Test-Path external/DLSS/include/nvsdk_ngx_params.h)) { throw 'Missing NGX headers' }
+
+      - name: Fetch pinned OpenVR header
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force external/openvr | Out-Null
+          curl.exe -fsSL -o external/openvr/openvr.h `
+            "https://raw.githubusercontent.com/ValveSoftware/openvr/$env:OPENVR_TAG/headers/openvr.h"
+          if ($LASTEXITCODE -ne 0) { throw 'OpenVR header download failed' }
+          $hash = (Get-FileHash external/openvr/openvr.h -Algorithm SHA256).Hash
+          if ($hash -ne $env:OPENVR_SHA256) { throw "OpenVR checksum mismatch: $hash" }
+
+      - name: Find original Microsoft fxc shader compiler
+        id: fxc
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\fxc.exe' -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'No fxc.exe found in Windows SDK' }
+          "path=$($fxc.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Using: $($fxc.FullName)"
+
+      - name: Build, test, and package three independently compiled variants
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'dist/OFXR-V577-Presenter-Isolation'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $modes = @('01-stock', '02-presenter-only', '03-direct-current')
+          $hashes = @{}
+          foreach ($mode in $modes) {
+            git checkout -- src/layer/openxr_layer.cpp src/d3d12/frame_synthesis.hlsl
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to restore exact upstream source' }
+            $diagnostic = if ($mode -eq '01-stock') { 'stock' } elseif ($mode -eq '02-presenter-only') {
+              'presenter-only'
+            } else { 'direct-current' }
+            python apply_diagnostic.py --root . --mode $diagnostic
+            if ($LASTEXITCODE -ne 0) { throw "Patch refused: $mode" }
+            git diff --check
+            if ($LASTEXITCODE -ne 0) { throw "Source diff error: $mode" }
+            $out = "$root/$mode"
+            New-Item -ItemType Directory -Force "$out/ofxr", "$out/licenses", `
+              "$out/external/OpenXR-SDK/LICENSES", "$out/external/Vulkan-Headers" | Out-Null
+            git diff --binary -- src/layer/openxr_layer.cpp src/d3d12/frame_synthesis.hlsl |
+              Out-File -Encoding utf8 "$out/SOURCE_CHANGE.patch"
+            $build = "build-diagnostic-$mode"
+            cmake -S . -B $build -G 'Visual Studio 17 2022' -A x64 `
+                -DXRFG_FXC_EXECUTABLE="${{ steps.fxc.outputs.path }}"
+            if ($LASTEXITCODE -ne 0) { throw "CMake configure failed: $mode" }
+            cmake --build $build --config Release --parallel
+            if ($LASTEXITCODE -ne 0) { throw "Compilation failed: $mode" }
+            $tests = "$out/TESTS.txt"
+            if ($mode -eq '03-direct-current') {
+              # Intentional non-reference synthetic pixels. Exclude upstream
+              # renderer/pixel/shader expectations; retain non-renderer tests.
+              $exclude = '(D3D12|d3d12|Pixel|pixel|Image|image|Synthesis|synthesis|Shader|shader|Render|render|GPU|gpu)'
+              & ctest --test-dir $build -C Release -N -E $exclude | Tee-Object -FilePath $tests
+              if ($LASTEXITCODE -ne 0) { throw "CTest discovery failed: $mode" }
+              & ctest --test-dir $build -C Release --output-on-failure `
+                  --timeout 300 -E $exclude -LE needs_gpu_timing | Tee-Object -Append -FilePath $tests
+              if ($LASTEXITCODE -ne 0) { throw "Non-renderer CTest regression: $mode" }
+              'Pixel-output regression tests excluded by design: pixel output deliberately differs from V577.' |
+                 Add-Content -Path $tests
+            } else {
+              & ctest --test-dir $build -C Release --output-on-failure `
+                  --timeout 300 -LE needs_gpu_timing | Tee-Object -FilePath $tests
+              if ($LASTEXITCODE -ne 0) { throw "CTest regression: $mode" }
+            }
+            Copy-Item "$build/Release/OFXRBridgeTray.exe" $out
+            Copy-Item "$build/Release/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll", `
+              "$build/Release/ofxr/OFXR_vulkan_queue_layer.dll", `
+              "$build/Release/ofxr/ofxr_bridge.ini" "$out/ofxr"
+            Copy-Item README.md, LICENSE, THIRD_PARTY.md $out
+            Copy-Item licenses/* "$out/licenses"
+            Copy-Item external/OpenXR-SDK/LICENSES/* "$out/external/OpenXR-SDK/LICENSES"
+            Copy-Item external/Vulkan-Headers/LICENSE.md "$out/external/Vulkan-Headers"
+            @"
+          Experimental OFXR V577 diagnostic -- UNSIGNED binary.
+          Exact upstream: $env:UPSTREAM_COMMIT
+          MODE=$mode
+          $(if ($mode -eq '01-stock') {'STOCK: no changes'} elseif ($mode -eq '02-presenter-only') {
+             'PRIME-only: real image copied into owned current swapchain; presenter repeats it in missing slots; no synthetic images.'
+           } else {
+             'DIRECT CURRENT: current B-frame color drawn into synthetic swapchain with original B-frame pose/FOV, original metadata-chain restrictions.'
+           })
+          Compare at 3X 72Hz, MSFS TAA, VDXR, SSW OFF, Hybrid OFF, HUD fix OFF, FidelityFX 25%.
+          Not production software. Keep a known-working official V577 backup.
+          Verify loaded DLL SHA256 at runtime. See experiment README.
+          "@ | Set-Content -Encoding utf8 "$out/VARIANT.txt"
+            $dll = "$out/ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll"
+            $hashes[$mode] = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash
+            "$mode DLL SHA256=$($hashes[$mode])" | Set-Content -Encoding ascii "$out/BUILD_SHA256.txt"
+            Remove-Item -Recurse -Force $build
+          }
+          if (@($hashes.Values | Sort-Object -Unique).Count -ne 3) {
+            throw 'The diagnostic DLLs were identical. Fail closed.'
+          }
+          Copy-Item apply_diagnostic.py "$root/PATCHER_SOURCE.py"
+          @'
+          ## Experiments
+          01-stock: unmodified upstream V577.
+          02-presenter-only: force prime instead of pairing so only the real B
+          image is copied into the owned current swapchain and submitted; the
+          presenter repeats the last valid owned image in empty 72 Hz slots.
+          03-direct-current: all normal pair slots + synthetic swapchains,
+          but the FidelityFX output pixel shader reads B's current image
+          directly. It leaves the GPU optical-flow pass running (not a perf test).
+          Its synthetic image references original B-frame pose/FOV; pointer
+          extensions are NOT blindly copied from source projections.
+          Event 988 contains sampled projection-chain diagnostics.
+          Do not confuse 72 accepted OpenXR submissions with headset scanout.
+          Both experimental modes are for controlled A/B investigation only.
+          '@ | Set-Content -Encoding utf8 "$root/EXPERIMENT_README.txt"
+          $env:UPSTREAM_COMMIT | Set-Content -Encoding ascii "$root/UPSTREAM_COMMIT.txt"
+
+      - name: Audit compiled EXEs and DLLs with Microsoft Defender
+        shell: pwsh
+        run: |
+          # This step DOES NOT assert that an unsigned binary is safe.
+          # Fail closed if on-runner anti-malware scanning is unavailable.
+          $ErrorActionPreference = 'Stop'
+          $auditRoot = 'dist/security-audit'
+          New-Item -ItemType Directory -Force $auditRoot | Out-Null
+          $report = Join-Path $auditRoot 'SecurityAudit.txt'
+          $lines = [System.Collections.Generic.List[string]]::new()
+          function Record([string] $message) {
+            $lines.Add($message)
+            Write-Host $message
+            $lines | Set-Content -Path $report -Encoding utf8
+          }
+          Record ('OFXR V577 presenter isolation Windows binary security audit; UTC: ' + (Get-Date).ToUniversalTime().ToString('o'))
+          Record ('Workflow: ' + $env:GITHUB_WORKFLOW)
+          Record ('Runner: ' + $env:RUNNER_OS)
+          Record ('Commit: ' + $env:UPSTREAM_COMMIT)
+          $root = (Resolve-Path 'dist/OFXR-V577-Presenter-Isolation').Path
+          $binaries = @(Get-ChildItem $root -Recurse -File | Where-Object {
+            $_.Extension -in @('.exe', '.dll')
+          } | Sort-Object FullName)
+          Record ('Binary count: ' + $binaries.Count)
+          if ($binaries.Count -ne 9) { throw 'Expected three EXEs and six DLLs' }
+          foreach ($binary in $binaries) {
+            $rel = $binary.FullName.Substring($root.Length + 1).Replace('\','/')
+            Record ('BIN SHA256=' + (Get-FileHash $binary.FullName -Algorithm SHA256).Hash + '  ' + $rel)
+          }
+          if (-not (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) -or
+              -not (Get-Command Start-MpScan -ErrorAction SilentlyContinue) -or
+              -not (Get-Command Get-MpThreatDetection -ErrorAction SilentlyContinue)) {
+            Record 'INDETERMINATE: Microsoft Defender scanning cmdlets are unavailable on this runner'
+            throw 'Security audit unavailable. Binary artifact not uploaded.'
+          }
+          try {
+            $status = Get-MpComputerStatus -ErrorAction Stop
+            Record ('Defender AMServiceEnabled=' + $status.AMServiceEnabled +
+              ' AntivirusEnabled=' + $status.AntivirusEnabled +
+              ' SignatureLastUpdated=' + $status.AntivirusSignatureLastUpdated)
+            if (-not $status.AMServiceEnabled -or -not $status.AntivirusEnabled) {
+              Record 'INDETERMINATE: Microsoft Defender Antivirus is disabled on this runner'
+              throw 'Security audit unavailable. Binary artifact not uploaded.'
+            }
+            if ($null -eq $status.AntivirusSignatureLastUpdated -or
+                $status.AntivirusSignatureLastUpdated -lt (Get-Date).AddDays(-14)) {
+              Record 'INDETERMINATE: Antivirus signatures are older than 14 days'
+              throw 'Defender signatures too old to permit artifact upload.'
+            }
+            $auditStart = (Get-Date).AddMinutes(-30)
+            foreach ($binary in $binaries) {
+              Record ('Scanning ' + $binary.FullName)
+              Start-MpScan -ScanType CustomScan -ScanPath $binary.FullName -ErrorAction Stop
+              if (-not (Test-Path -LiteralPath $binary.FullName)) {
+                Record ('DETECTION OR QUARANTINE: binary disappeared after scanning: ' + $binary.Name)
+                throw 'Security scan removed a file. Binary artifact not uploaded.'
+              }
+            }
+            $detections = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object {
+              $_.InitialDetectionTime -ge $auditStart
+            })
+            foreach ($detection in $detections) {
+              Record ('DETECTION: ThreatID=' + $detection.ThreatID +
+                ' Time=' + $detection.InitialDetectionTime +
+                ' Resources=' + ($detection.Resources -join ';'))
+            }
+            if ($detections.Count -gt 0) {
+              throw 'Defender reported detections. Binary artifact not uploaded.'
+            }
+            Record 'SCAN RESULT: no recent detections returned by Microsoft Defender on this runner.'
+            Record 'LIMITATION: a clean scan is NOT proof of safety; browser warning may remain.'
+          } catch {
+            Record ('AUDIT FAILED: ' + $_.Exception.Message)
+            throw
+          }
+
+      - name: Upload source-only security audit report (no binaries)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-V577-SECURITY-AUDIT-TEXT-ONLY
+          path: dist/security-audit/SecurityAudit.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload three diagnostic variants after Defender audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-V577-Presenter-Isolation-UNSIGNED
+          path: dist/OFXR-V577-Presenter-Isolation/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostic logs if build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-Presenter-Isolation-failed-build-logs
+          path: |
+            build-diagnostic-*/Testing/Temporary/LastTest.log
+            build-diagnostic-*/Testing/Temporary/*.log
+            build-diagnostic-*/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
