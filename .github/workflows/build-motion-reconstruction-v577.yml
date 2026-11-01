@@ -43,7 +43,7 @@ jobs:
           @'
           #!/usr/bin/env python3
           """Fail-closed patch for pinned OFXR V577. AMD/TAA 3X MSFS-only.
-          
+
           A: synthesised projection position is interpolated A->B; the stock shader
           already removes camera rotation, so its B orientation/FOV are retained.
           B: FFX flow gets edge-local image correspondence refinement with a 3D
@@ -54,17 +54,17 @@ jobs:
           from __future__ import annotations
           import argparse
           from pathlib import Path
-          
+
           PINNED='0650cd4b1ccd57ad4d7e7fad2ba5b0aa43fe663e'
           APP='src/layer/openxr_layer.cpp'
           SYNTH='src/d3d12/d3d12_frame_synthesizer.cpp'
           SHADER='src/d3d12/frame_synthesis.hlsl'
-          
+
           def once(s, old, new, label):
               count=s.count(old)
               if count!=1: raise RuntimeError(f'FAIL CLOSED {label}: expected once, found {count}')
               return s.replace(old,new,1)
-          
+
           GATE=r'''// Standalone process gate: no additional API layer changes in tests or games.
           [[nodiscard]] bool xrfg_recon_msfs() noexcept {
               static const bool enabled = []() noexcept {
@@ -77,9 +77,9 @@ jobs:
               }();
               return enabled;
           }
-          
+
           '''
-          
+
           APP_FUNC='''[[nodiscard]] bool build_generated_frame_end_info(
               const XrFrameEndInfo* source,
               const ProjectionSnapshot& current_snapshot,
@@ -133,9 +133,9 @@ jobs:
                       }
                       if (synthetic) {
                           // The V008 shader generates the synthetic image in B's camera'''
-          
+
           SYNTH_ANCHOR='''}  // namespace
-          
+
           struct D3D12FrameSynthesizer::Impl {'''
           SYNTH_SUPPORT=r'''// Relative B minus A camera translation expressed in B's axes. For
           // FidelityFX only: game-motion constants are zero/unused in this route.
@@ -153,7 +153,7 @@ jobs:
                   return {0.0F,0.0F,0.0F};
               return {local.x,local.y,local.z};
           }
-          
+
           '''
           # The standard fidelityFX path populates root constants, and the draw's
           # per-output flag remap keeps bit30 via & 0xFF0000FFU. No new descriptors.
@@ -194,7 +194,7 @@ jobs:
                       }
                   }
                   // V546: the eye order of two streams nothing else tells apart.'''
-          
+
           # Insert after flow_for_pixel (must be declared before use); after
           # forward_flow_for_pixel and helpers? place immediately BEFORE synthesize_midpoint
           # so all color/flow and geometric helpers are declared already.
@@ -222,31 +222,37 @@ jobs:
           // surface (e.g. moving props, TAA ghosting, reflected scenery).
           struct XrfgDepthEstimate {float distance;float confidence;};
           XrfgDepthEstimate xrfg_recon_depth(float2 pB,float2 pA,uint eye) {
-              XrfgDepthEstimate bad;bad.distance=0.0;bad.confidence=0.0;
+              // FXC's SM5 control-flow analysis is not reliable with early returns
+              // from a function returning a struct. Always initialize every output,
+              // and use a single return after all guarded computations.
+              XrfgDepthEstimate answer;
+              answer.distance=0.0;
+              answer.confidence=0.0;
               CameraMapping m=PreviousMappings[eye];
               float3 baseline=xrfg_recon_baseline(eye);
               float baseline2=dot(baseline,baseline);
-              if (baseline2<0.000004 || baseline2>0.0625) return bad;
-              float2 bxy=xrfg_recon_tangent(pB,m.TargetRect,m.TargetTangents);
-              float2 axy=xrfg_recon_tangent(pA,m.SourceRect,m.SourceTangents);
-              float3 rb=float3(bxy,-1.0);
-              float4 ainb=float4(-m.TargetToSourceRotation.xyz,
-                                    m.TargetToSourceRotation.w);
-              float3 ra=rotate_by_quaternion(ainb,float3(axy,-1.0));
-              float aa=dot(ra,ra), bb=dot(ra,rb), cc=dot(rb,rb);
-              float dd=dot(ra,baseline), ee=dot(rb,baseline);
-              float denom=aa*cc-bb*bb;
-              if (denom<0.00000001) return bad;
-              float tb=(bb*dd-aa*ee)/denom;
-              float ta=(dd+bb*tb)/aa;
-              if (tb<0.25 || tb>150.0 || ta<0.25 || ta>155.0) return bad;
-              float miss=length(ta*ra-tb*rb-baseline);
-              // Scale tolerance with distance to avoid rejecting a long-range ray
-              // because of a subpixel optical-flow rounding error.
-              float tolerance=0.008+0.0015*tb;
-              bad.distance=tb;
-              bad.confidence=saturate(1.0-miss/max(tolerance,0.008));
-              return bad;
+              if (baseline2>=0.000004 && baseline2<=0.0625) {
+                  float2 bxy=xrfg_recon_tangent(pB,m.TargetRect,m.TargetTangents);
+                  float2 axy=xrfg_recon_tangent(pA,m.SourceRect,m.SourceTangents);
+                  float3 rb=float3(bxy,-1.0);
+                  float4 ainb=float4(-m.TargetToSourceRotation.xyz,
+                                        m.TargetToSourceRotation.w);
+                  float3 ra=rotate_by_quaternion(ainb,float3(axy,-1.0));
+                  float aa=dot(ra,ra), bb=dot(ra,rb), cc=dot(rb,rb);
+                  float dd=dot(ra,baseline), ee=dot(rb,baseline);
+                  float denom=aa*cc-bb*bb;
+                  if (denom>=0.00000001) {
+                      float tb=(bb*dd-aa*ee)/denom;
+                      float ta=(dd+bb*tb)/aa;
+                      if (tb>=0.25 && tb<=150.0 && ta>=0.25 && ta<=155.0) {
+                          float miss=length(ta*ra-tb*rb-baseline);
+                          float tolerance=0.008+0.0015*tb;
+                          answer.distance=tb;
+                          answer.confidence=saturate(1.0-miss/max(tolerance,0.008));
+                      }
+                  }
+              }
+              return answer;
           }
           float xrfg_recon_rgb_error(float3 a,float3 b) {
               float3 d=abs(a-b);
@@ -257,48 +263,60 @@ jobs:
           // occlusion/moving object cannot be forced into a spurious depth solution.
           float2 xrfg_recon_refine_flow(float2 pixel,float2 raw,uint slice,uint eye,
                                         float4 current_color) {
-              if (!xrfg_recon_enabled() || repeated_capture_flag()!=0u) return raw;
-              const float3 baseline=xrfg_recon_baseline(eye);
-              if (dot(baseline,baseline)<0.000004) return raw;
-              float2 pA=pixel+raw;
-              CameraMapping m=PreviousMappings[eye];
-              float2 minP=m.SourceRect.xy;
-              float2 maxP=minP+m.SourceRect.zw-1.0;
-              if (any(pA<minP) || any(pA>maxP)) return raw;
-              float3 b=current_color.rgb;
-              float3 l=bilinear_current_source(pixel+float2(-1.0,0.0),slice).rgb;
-              float3 r=bilinear_current_source(pixel+float2( 1.0,0.0),slice).rgb;
-              float3 u=bilinear_current_source(pixel+float2(0.0,-1.0),slice).rgb;
-              float3 d=bilinear_current_source(pixel+float2(0.0, 1.0),slice).rgb;
-              float2 grad=float2(dot(r-l,float3(0.2126,0.7152,0.0722)),
-                                 dot(d-u,float3(0.2126,0.7152,0.0722)));
-              float edge=length(grad);
-              if (edge<0.045) return raw; // Interiors retain stock's flow.
-              float2 normal=grad/max(edge,0.0001);
-              float mismatch=xrfg_recon_rgb_error(
-                  bilinear_previous_source(pA,slice).rgb,b);
-              if (mismatch<0.06) return raw; // No correction needed.
-              XrfgDepthEstimate initial=xrfg_recon_depth(pixel,pA,eye);
-              float best_score=mismatch+0.004*(1.0-initial.confidence);
-              float2 best=raw;
-              // Four full-resolution pixel-level candidates, edge-normal only.
-              // Unrolled, with geometric validation and a penalty for overshooting.
-              [unroll] for (uint i=0u;i<4u;++i) {
-                  float offset=i==0u?-2.0:i==1u?-1.0:i==2u?1.0:2.0;
-                  float2 candidate=pA+normal*offset;
-                  if (any(candidate<minP) || any(candidate>maxP)) continue;
-                  float err=xrfg_recon_rgb_error(
-                      bilinear_previous_source(candidate,slice).rgb,b);
-                  XrfgDepthEstimate depth=xrfg_recon_depth(pixel,candidate,eye);
-                  // Under strong parallax, preserve surfaces with a plausible depth.
-                  float penalty=depth.confidence>0.25 ? 0.0 : 0.035;
-                  float score=err+abs(offset)*0.006+penalty;
-                  if (score<best_score) {best_score=score;best=candidate-pixel;}
+              // Every path returns this fully initialized result. In particular, no
+              // early return / loop continue: fxc /WX otherwise misidentifies the
+              // function result as potentially uninitialized (X4000/X3129).
+              float2 refined=raw;
+              if (xrfg_recon_enabled() && repeated_capture_flag()==0u) {
+                  float3 baseline=xrfg_recon_baseline(eye);
+                  float2 pA=pixel+raw;
+                  CameraMapping m=PreviousMappings[eye];
+                  float2 minP=m.SourceRect.xy;
+                  float2 maxP=minP+m.SourceRect.zw-1.0;
+                  bool original_inside=all(pA>=minP) && all(pA<=maxP);
+                  if (dot(baseline,baseline)>=0.000004 && original_inside) {
+                      float3 b=current_color.rgb;
+                      float3 l=bilinear_current_source(pixel+float2(-1.0,0.0),slice).rgb;
+                      float3 r=bilinear_current_source(pixel+float2( 1.0,0.0),slice).rgb;
+                      float3 u=bilinear_current_source(pixel+float2(0.0,-1.0),slice).rgb;
+                      float3 d=bilinear_current_source(pixel+float2(0.0, 1.0),slice).rgb;
+                      float2 grad=float2(dot(r-l,float3(0.2126,0.7152,0.0722)),
+                                         dot(d-u,float3(0.2126,0.7152,0.0722)));
+                      float edge=length(grad);
+                      if (edge>=0.045) {
+                          float2 normal=grad/max(edge,0.0001);
+                          float mismatch=xrfg_recon_rgb_error(
+                              bilinear_previous_source(pA,slice).rgb,b);
+                          if (mismatch>=0.06) {
+                              XrfgDepthEstimate initial=xrfg_recon_depth(pixel,pA,eye);
+                              float best_score=mismatch+0.004*(1.0-initial.confidence);
+                              float2 best=raw;
+                              [unroll] for (uint i=0u;i<4u;++i) {
+                                  float offset=i==0u?-2.0:i==1u?-1.0:i==2u?1.0:2.0;
+                                  float2 candidate=pA+normal*offset;
+                                  bool candidate_inside=all(candidate>=minP) && all(candidate<=maxP);
+                                  if (candidate_inside) {
+                                      float err=xrfg_recon_rgb_error(
+                                          bilinear_previous_source(candidate,slice).rgb,b);
+                                      XrfgDepthEstimate depth=xrfg_recon_depth(pixel,candidate,eye);
+                                      float penalty=depth.confidence>0.25 ? 0.0 : 0.035;
+                                      float score=err+abs(offset)*0.006+penalty;
+                                      if (score<best_score) {
+                                          best_score=score;
+                                          best=candidate-pixel;
+                                      }
+                                  }
+                              }
+                              if (best_score<mismatch*0.8 && best_score<0.18) {
+                                  refined=best;
+                              }
+                          }
+                      }
+                  }
               }
-              // A strong correspondence is required before moving a cockpit edge.
-              return best_score < mismatch*0.8 && best_score<0.18 ? best : raw;
+              return refined;
           }
-          
+
           '''
           SHADER_FLOW='''                    raw_backward = repeated_capture_flag() != 0
                                   ? float2(0.0, 0.0)
@@ -362,8 +380,8 @@ jobs:
           #endif
                               }
                               }'''
-          
-          
+
+
           def patch(root:Path,mode:str)->None:
               paths={k:root/v for k,v in [('app',APP),('synth',SYNTH),('shader',SHADER)]}
               src={k:p.read_text(encoding='utf-8').replace('\r\n','\n') for k,p in paths.items()}
@@ -396,7 +414,7 @@ jobs:
               for k,v in [('app','994'),('synth','995'),('synth','(1U<<30U)'),('shader','(1u<<30u)')]:
                   assert v in {'app':app,'synth':synth,'shader':shader}[k]
               print(f'Applied V577 AMD parallax/edge reconstruction to {mode} (MSFS-only)')
-          
+
           if __name__=='__main__':
               cli=argparse.ArgumentParser()
               cli.add_argument('--root',type=Path,required=True)
@@ -414,7 +432,7 @@ jobs:
           import math, os, random, shutil, subprocess, tempfile
           from pathlib import Path
           import apply_reconstruction as recon
-          
+
           @dataclass
           class V:
               x:float;y:float;z:float
@@ -423,7 +441,7 @@ jobs:
               def __mul__(self,a):return V(self.x*a,self.y*a,self.z*a)
               def dot(self,b):return self.x*b.x+self.y*b.y+self.z*b.z
               def size(self):return math.sqrt(self.dot(self))
-          
+
           def infer(A,B,ray_A,ray_B):
               baseline=B-A
               a=ray_A.dot(ray_A);b=ray_A.dot(ray_B);c=ray_B.dot(ray_B)
@@ -433,7 +451,7 @@ jobs:
               tB=(b*d-a*e)/den
               tA=(d+b*tB)/a
               return tA,tB,(ray_A*tA-ray_B*tB-baseline).size()
-          
+
           def run():
               rng=random.Random(577)
               good=0
@@ -467,6 +485,20 @@ jobs:
               assert 'view.pose.position=' in recon.APP_NEW
               assert recon.SHADER_HELPERS.count('XrfgDepthEstimate')>2
               assert recon.SYNTH_MASK_NEW.count('parameters.synthesis_flags|=(1U<<30U)')==1
+              # Legacy FXC /WX flags early-return HLSL functions as uninitialized.
+              # Guard the actual embedded functions, not a hand-written approximation.
+              import re
+              helpers=recon.SHADER_HELPERS
+              depth=helpers.split('XrfgDepthEstimate xrfg_recon_depth(',1)[1].split('float xrfg_recon_rgb_error(',1)[0]
+              refine=helpers.split('float2 xrfg_recon_refine_flow(',1)[1]
+              for label,fn in [('depth',depth),('refine',refine)]:
+                  code=re.sub(r'//[^\n]*','',fn)
+                  statements=re.findall(r'\breturn\b',code)
+                  assert len(statements)==1, (label,'must have exactly one return',len(statements))
+                  assert 'continue;' not in code,(label,'must not use continue')
+                  assert code.rfind('return ')>code.find('if '),(label,'single return must be last')
+              assert 'answer.distance=0.0;' in depth and 'answer.confidence=0.0;' in depth
+              assert 'float2 refined=raw;' in refine
               # Verify code templates really close and do not create unsafe OpenXR chains.
               assert 'view.next =' not in recon.APP_NEW
               assert 'source->displayTime' not in recon.APP_NEW
@@ -486,7 +518,7 @@ jobs:
                       subprocess.run([compiler,'-std=c++20','-Wall','-Wextra','-Werror',str(code),'-o',str(exe)],check=True)
                       subprocess.run([str(exe)],check=True)
               print(f'PASS {good} 3D parallax/pose cases, edge/occlusion contract, C++ helper probe')
-          
+
           if __name__=='__main__':run()
           '@ | Set-Content -Encoding utf8 test_reconstruction.py
           python -m py_compile apply_reconstruction.py test_reconstruction.py
@@ -552,6 +584,36 @@ jobs:
           if (-not $fxc) { throw 'No fxc.exe found in Windows SDK' }
           "path=$($fxc.FullName)" >> $env:GITHUB_OUTPUT
           Write-Host "Using: $($fxc.FullName)"
+
+      - name: Strict FXC shader preflight (before slow MSVC builds)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git checkout -- src/layer/openxr_layer.cpp src/d3d12/frame_synthesis.hlsl src/d3d12/d3d12_frame_synthesizer.cpp
+          if ($LASTEXITCODE -ne 0) { throw 'Source reset failed before FXC preflight' }
+          python apply_reconstruction.py --root . --mode reconstructed
+          if ($LASTEXITCODE -ne 0) { throw 'Reconstruction source patch failed before FXC preflight' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Whitespace validation failed' }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\xrfg-shader-preflight" | Out-Null
+          $cases = @(
+            @{entry='SynthesizeMidpointPS';target='ps_5_1';define=$null},
+            @{entry='SynthesizeNvidiaMidpointPS';target='ps_5_1';define=$null},
+            @{entry='SynthesizeHybridMidpointPS';target='ps_5_1';define='XRFG_HYBRID=1'},
+            @{entry='PackFlowInput';target='cs_5_0';define=$null}
+          )
+          foreach ($case in $cases) {
+            $out = Join-Path "$env:RUNNER_TEMP\xrfg-shader-preflight" ($case.entry + '.cso')
+            $args = @('/nologo','/T',$case.target,'/E',$case.entry,
+              '/O3','/WX','/Ges','/Qstrip_debug','/Qstrip_reflect','/Fo',$out)
+            if ($case.define) { $args += @('/D',$case.define) }
+            $args += 'src/d3d12/frame_synthesis.hlsl'
+            Write-Host ('FXC preflight ' + $case.entry + ' ' + $case.target)
+            & "${{ steps.fxc.outputs.path }}" @args
+            if ($LASTEXITCODE -ne 0) { throw ('FXC strict shader failure: ' + $case.entry) }
+            if (-not (Test-Path $out)) { throw ('FXC produced no output for ' + $case.entry) }
+          }
+          Write-Host 'FXC preflight PASSED; the full CMake build still compiles every shader variant.'
 
       - name: Compile both complete release variants and run all CI-compatible CTests
         shell: pwsh
